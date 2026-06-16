@@ -1,0 +1,18 @@
+{
+  "name": "proof-of-deploy-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AttestationRegistry — minimal testnet contract for proof-of-deploy (no real funds).",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "hardhat test",
+    "compile": "hardhat compile",
+    "deploy:base-sepolia": "hardhat run scripts/deploy.js --network baseSepolia",
+    "deploy:polygon-amoy": "hardhat run scripts/deploy.js --network polygonAmoy"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "hardhat": "^2.22.10"
+  }
+}
