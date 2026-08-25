@@ -35,11 +35,11 @@ const defaultReplicas int32 = 1
 // otherwise make the hash unstable, so they are excluded from BOTH the
 // Deployment labels and the pod template labels.
 var generatedLabelKeys = map[string]struct{}{
-	"pod-template-hash":                  {},
-	"controller-revision-hash":           {},
-	"pod-template-generation":            {},
-	"statefulset.kubernetes.io/pod-name": {},
-	"apps.kubernetes.io/pod-index":       {},
+	"pod-template-hash":                        {},
+	"controller-revision-hash":                 {},
+	"pod-template-generation":                  {},
+	"statefulset.kubernetes.io/pod-name":       {},
+	"apps.kubernetes.io/pod-index":             {},
 	"batch.kubernetes.io/job-completion-index": {},
 }
 

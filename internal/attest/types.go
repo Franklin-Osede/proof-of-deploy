@@ -48,8 +48,8 @@ type NormalizedDeployment struct {
 // and matchExpressions are included because both express user intent about
 // which pods the Deployment owns.
 type NormalizedSelector struct {
-	MatchLabels      map[string]string         `json:"matchLabels"`
-	MatchExpressions []NormalizedSelectorReq   `json:"matchExpressions"`
+	MatchLabels      map[string]string       `json:"matchLabels"`
+	MatchExpressions []NormalizedSelectorReq `json:"matchExpressions"`
 }
 
 // NormalizedSelectorReq is a single set-based selector requirement. Values are

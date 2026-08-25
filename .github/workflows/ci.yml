@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # go-version-file pins the toolchain to the `go` directive in go.mod.
+      # The config hash is a wire format, so the toolchain that produces it is
+      # part of the protocol's reproducibility story, not just build hygiene.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go.mod / go.sum are tidy and committed
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      # Fails on a formatting difference rather than rewriting the checkout.
+      - name: gofmt
+        run: make fmt-check
+
+      - name: vet
+        run: make vet
+
+      - name: build
+        run: make build
+
+      - name: test
+        run: make test
+
+  contracts:
+    name: Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # TODO: switch to `npm ci` once contracts/package-lock.json is committed.
+      - name: hardhat test
+        working-directory: contracts
+        run: |
+          npm install
+          npm test
