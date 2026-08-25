@@ -49,9 +49,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      # TODO: switch to `npm ci` once contracts/package-lock.json is committed.
+          cache: npm
+          cache-dependency-path: contracts/package-lock.json
       - name: hardhat test
         working-directory: contracts
         run: |
-          npm install
+          npm ci
           npm test

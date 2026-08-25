@@ -45,11 +45,11 @@ test: vet ## Run all unit tests (no cluster required).
 ##@ Contracts
 .PHONY: contracts-compile
 contracts-compile: ## Compile the Solidity contracts.
-	cd contracts && npm install && npm run compile
+	cd contracts && npm ci && npm run compile
 
 .PHONY: contracts-test
 contracts-test: ## Run the Hardhat contract tests.
-	cd contracts && npm install && npm test
+	cd contracts && npm ci && npm test
 
 ##@ Build
 .PHONY: build
