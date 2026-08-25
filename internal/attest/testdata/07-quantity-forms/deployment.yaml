@@ -1,0 +1,29 @@
+# Resource quantities written in non-canonical notations. Pins exactly what
+# resource.Quantity.String() produces, which is the single least-guarded part
+# of the hash contract: its canonical form is decided by an upstream library.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: payments
+  name: quantities
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quantities
+  template:
+    metadata:
+      labels:
+        app: quantities
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/acme/quantities:1.0.0
+          resources:
+            requests:
+              cpu: "0.25"
+              memory: "1024Mi"
+              ephemeral-storage: "2G"
+            limits:
+              cpu: "2000m"
+              memory: "1073741824"

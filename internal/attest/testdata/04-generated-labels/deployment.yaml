@@ -1,0 +1,42 @@
+# 01-baseline plus controller-generated labels on both the Deployment and the
+# pod template. These are denylisted, so the hash must be unchanged.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: payments
+  name: api
+  labels:
+    app: api
+    team: payments
+    pod-template-hash: "7d9fbb54c"
+    controller-revision-hash: "api-6b5c"
+    pod-template-generation: "4"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+        pod-template-hash: "7d9fbb54c"
+        apps.kubernetes.io/pod-index: "0"
+    spec:
+      containers:
+        - name: server
+          image: ghcr.io/acme/api:1.4.2
+          env:
+            - name: LOG_LEVEL
+              value: info
+            - name: DB_PASSWORD
+              value: super-secret
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+        - name: sidecar
+          image: ghcr.io/acme/proxy:0.9.0

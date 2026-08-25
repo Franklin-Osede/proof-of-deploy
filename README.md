@@ -203,6 +203,26 @@ and redistributing its address to every consumer.
 
 ---
 
+## Golden vectors
+
+`internal/attest/testdata` freezes the v1 wire format: for each fixture, the
+input Deployment, the exact canonical JSON bytes, the config hash and the
+deployment ID. Each fixture is self-checking — the test asserts that the stored
+hash really is SHA-256 of the stored JSON — and a fixed test key plus a
+precomputed signature pins the rule that the signature is taken over the config
+hash bytes directly, with no second hashing.
+
+A diff in any golden file is a protocol change. Regenerate deliberately:
+
+```sh
+go test ./internal/attest -run TestGolden -update
+```
+
+Three tests assert behaviour that is **wrong on purpose**: the benign/tampered
+pair that hashes alike, and the two determinism defects above. Each is written
+to fail once the defect is fixed, so the fix has to be a conscious, versioned
+decision rather than a silent one.
+
 ## Hash versioning
 
 The JSON field order, the JSON tags, and the canonical encoding in
@@ -296,7 +316,15 @@ Honest inventory of what is missing, roughly in priority order.
 - `internal/signer` validates `KeyUsage` but not `KeySpec`, so a non-P-256 key
   fails late instead of at startup. `PublicKeyDER()` returns its internal slice
   uncopied.
-- `matchExpressions` sorting has no tiebreak on `values`.
+- **The hash is not fully deterministic.** Two defects, both pinned by tests in
+  `internal/attest/golden_test.go`:
+  - `matchExpressions` sorts by `(key, operator)` with no tiebreak on `values`,
+    so two requirements sharing a key and operator keep their declaration order
+    and the hash depends on how the manifest was written.
+  - Quantities are canonicalized by `resource.Quantity`'s **format**, not its
+    **value**. `1Gi`, `1024Mi` and `1048576Ki` all hash alike, but the identical
+    number of bytes written as `1073741824` hashes differently. This is the
+    inverse of the surface weakness above: it produces a false FAIL.
 - `Selector.MatchLabels` is not filtered through the generated-label denylist,
   while pod template labels are.
 - Readiness is `healthz.Ping`: a permanently failing pipeline reports Ready.

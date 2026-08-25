@@ -15,7 +15,10 @@ require (
 	sigs.k8s.io/controller-runtime v0.18.4
 )
 
-require github.com/go-logr/logr v1.4.1
+require (
+	github.com/go-logr/logr v1.4.1
+	sigs.k8s.io/yaml v1.3.0
+)
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
@@ -105,5 +108,4 @@ require (
 	rsc.io/tmplfunc v0.0.3 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
 	sigs.k8s.io/structured-merge-diff/v4 v4.4.1 // indirect
-	sigs.k8s.io/yaml v1.3.0 // indirect
 )

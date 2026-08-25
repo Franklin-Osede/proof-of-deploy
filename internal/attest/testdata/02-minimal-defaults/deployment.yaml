@@ -1,0 +1,13 @@
+# No replicas (defaults to 1), no selector, no labels, no env, no resources.
+# Exercises the "always emit {} not null" rule and the replicas default.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: default
+  name: bare
+spec:
+  template:
+    spec:
+      containers:
+        - name: only
+          image: nginx:1.27

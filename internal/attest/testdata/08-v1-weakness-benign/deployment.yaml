@@ -1,0 +1,33 @@
+# Half of the pair that documents v1's central weakness. Mirrors
+# config/samples/demo-deployment.yaml. Compare with 09-v1-weakness-tampered:
+# the two MUST hash identically under v1, and MUST differ under v2.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: demo
+  name: api
+  labels:
+    app: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: server
+          image: registry.k8s.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097
+          env:
+            - name: LOG_LEVEL
+              value: info
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

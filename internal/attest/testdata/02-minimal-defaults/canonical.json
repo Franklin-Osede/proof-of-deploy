@@ -1,0 +1,1 @@
+{"namespace":"default","name":"bare","labels":{},"replicas":1,"selector":{"matchLabels":{},"matchExpressions":[]},"podTemplateLabels":{},"containers":[{"name":"only","image":"nginx:1.27","envNames":[],"resources":{"requests":{},"limits":{}}}]}

@@ -1,0 +1,36 @@
+# Canonical reference input. Every other fixture is described relative to this.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: payments
+  name: api
+  labels:
+    app: api
+    team: payments
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: server
+          image: ghcr.io/acme/api:1.4.2
+          env:
+            - name: LOG_LEVEL
+              value: info
+            - name: DB_PASSWORD
+              value: super-secret
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+        - name: sidecar
+          image: ghcr.io/acme/proxy:0.9.0

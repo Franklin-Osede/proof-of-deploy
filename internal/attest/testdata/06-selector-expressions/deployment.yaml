@@ -1,0 +1,33 @@
+# matchExpressions declared out of order, with values out of order. Exercises
+# the sort in normalizeSelector. NOTE: v1 sorts requirements by (key, operator)
+# only -- there is no tiebreak on values, which this fixture pins as current
+# behaviour, not as desired behaviour.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: payments
+  name: selective
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      tier: backend
+      app: selective
+    matchExpressions:
+      - key: zone
+        operator: In
+        values: ["eu-west-3", "eu-west-1", "eu-west-2"]
+      - key: app
+        operator: NotIn
+        values: ["legacy"]
+      - key: app
+        operator: In
+        values: ["selective"]
+  template:
+    metadata:
+      labels:
+        app: selective
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/acme/selective:2.0.0

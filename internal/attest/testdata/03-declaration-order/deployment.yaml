@@ -1,0 +1,37 @@
+# Identical content to 01-baseline, declared in a different order: labels,
+# env vars, containers and resource keys are all scrambled. Must hash the same.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: payments
+  name: api
+  labels:
+    team: payments
+    app: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: sidecar
+          image: ghcr.io/acme/proxy:0.9.0
+        - name: server
+          image: ghcr.io/acme/api:1.4.2
+          env:
+            - name: DB_PASSWORD
+              value: super-secret
+            - name: LOG_LEVEL
+              value: info
+          resources:
+            limits:
+              memory: 1Gi
+              cpu: "1"
+            requests:
+              memory: 512Mi
+              cpu: 250m

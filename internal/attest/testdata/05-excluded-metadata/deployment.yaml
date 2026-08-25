@@ -1,0 +1,51 @@
+# 01-baseline plus annotations, status, uid, resourceVersion, generation and
+# timestamps. All excluded, so the hash must be unchanged. Note the env VALUE
+# also differs: values are excluded by design so Secrets never reach the chain.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: payments
+  name: api
+  uid: 1d1e2f3a-0000-0000-0000-000000000000
+  resourceVersion: "99999"
+  generation: 7
+  creationTimestamp: "2026-01-01T00:00:00Z"
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: "{...}"
+    deployment.kubernetes.io/revision: "4"
+  labels:
+    app: api
+    team: payments
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: server
+          image: ghcr.io/acme/api:1.4.2
+          env:
+            - name: LOG_LEVEL
+              value: info
+            - name: DB_PASSWORD
+              value: a-completely-different-secret
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+        - name: sidecar
+          image: ghcr.io/acme/proxy:0.9.0
+status:
+  observedGeneration: 7
+  replicas: 3
+  readyReplicas: 3
+  availableReplicas: 3
+  updatedReplicas: 3
