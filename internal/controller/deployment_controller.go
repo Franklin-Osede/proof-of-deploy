@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,9 +50,13 @@ type DeploymentReconciler struct {
 	// lastAttested deduplicates by remembering the most recently attested
 	// config hash per Deployment ID. It is an in-memory optimization: on
 	// operator restart it is empty, so the next converged observation may
-	// re-publish one identical attestation. That is harmless (the contract
-	// stores "latest" idempotently) and costs at most one extra testnet
-	// transaction. See README "Failure modes".
+	// re-publish one identical attestation, costing one extra testnet
+	// transaction.
+	//
+	// Entries are dropped when a Deployment is observed to be gone, so a later
+	// recreation under the same namespace/name is attested as the new
+	// incarnation it is instead of being masked by the previous one's record.
+	// See README "Failure modes" for the window this still leaves open.
 	mu           sync.Mutex
 	lastAttested map[[32]byte][32]byte
 }
@@ -59,19 +64,34 @@ type DeploymentReconciler struct {
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 
 // Reconcile observes a Deployment and, on convergence, enqueues an attestation.
-// It is idempotent and deliberately tolerant: any internal error is logged and
-// swallowed (returns nil) rather than retried aggressively or propagated,
-// because nothing this controller does should ever back-pressure the cluster's
-// handling of the Deployment itself.
+// It is idempotent and deliberately tolerant: attestation-side errors (hashing,
+// and downstream of here signing and publishing) are logged and swallowed
+// rather than retried aggressively, because nothing this controller does should
+// ever back-pressure the cluster's handling of the Deployment itself.
+//
+// The one error that IS returned is a failed read of the Deployment, which
+// controller-runtime then retries. Retrying a read applies no back-pressure —
+// this controller holds only get/list/watch and cannot mutate, delay, or block
+// a Deployment — while swallowing it would silently stop attesting an object
+// that still exists.
 func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	id := attest.DeploymentID(req.Namespace, req.Name)
+
 	var dep appsv1.Deployment
 	if err := r.Get(ctx, req.NamespacedName, &dep); err != nil {
-		// Not found => deleted; nothing to attest. We intentionally do not
-		// remove dedup state: a recreated Deployment with the same config
-		// should still be attested, so we treat absence as a no-op only.
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// Deleted. Nothing to attest — the contract has no tombstone — but
+			// the dedup entry must go. DeploymentID is SHA-256("namespace/name")
+			// and carries no UID, so a recreation reuses this exact key; keeping
+			// the entry would make us skip the new incarnation and leave it
+			// covered only by the previous incarnation's on-chain record.
+			r.forgetAttested(id)
+			return ctrl.Result{}, nil
+		}
+		log.Error(err, "failed to read deployment; will retry")
+		return ctrl.Result{}, err
 	}
 
 	if !rolloutConverged(&dep) {
@@ -91,7 +111,6 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	id := attest.DeploymentID(dep.Namespace, dep.Name)
 	if r.alreadyAttested(id, configHash) {
 		return ctrl.Result{}, nil
 	}
@@ -123,6 +142,14 @@ func (r *DeploymentReconciler) recordAttested(id, hash [32]byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.lastAttested[id] = hash
+}
+
+// forgetAttested drops the dedup entry for a Deployment that no longer exists,
+// so a recreation under the same namespace/name is attested afresh.
+func (r *DeploymentReconciler) forgetAttested(id [32]byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.lastAttested, id)
 }
 
 // rolloutConverged reports whether a Deployment has reached a stable applied
