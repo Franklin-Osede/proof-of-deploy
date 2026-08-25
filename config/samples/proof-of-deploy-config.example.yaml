@@ -1,0 +1,31 @@
+# TEMPLATE ONLY — every value below is a placeholder. Do NOT `kubectl apply`
+# this file as-is, and do NOT commit a filled-in copy.
+#
+# The operator reads its configuration from a Secret named
+# proof-of-deploy-config in the operator's namespace. Create it out of band:
+#
+#   kubectl -n proof-of-deploy-system create secret generic proof-of-deploy-config \
+#     --from-literal=KMS_KEY_ID=<key id, ARN or alias> \
+#     --from-literal=ETH_RPC_URL=<testnet JSON-RPC endpoint> \
+#     --from-literal=CONTRACT_ADDRESS=<deployed AttestationRegistry> \
+#     --from-literal=ETH_PRIVATE_KEY=<throwaway TESTNET key> \
+#     --from-literal=CHAIN_ID=<evm chain id>
+#
+# ETH_PRIVATE_KEY is a gas-paying key for a DISPOSABLE testnet wallet. It is not
+# an attestation key — attestations are signed inside KMS and that private key
+# never leaves KMS. Never put a mainnet key or a key holding real funds here.
+#
+# AWS credentials should come from IRSA or an instance profile, never from this
+# Secret. See README "Trust boundary".
+apiVersion: v1
+kind: Secret
+metadata:
+  name: proof-of-deploy-config
+  namespace: proof-of-deploy-system
+type: Opaque
+stringData:
+  KMS_KEY_ID: REPLACE_ME
+  ETH_RPC_URL: REPLACE_ME
+  CONTRACT_ADDRESS: REPLACE_ME
+  ETH_PRIVATE_KEY: REPLACE_ME
+  CHAIN_ID: REPLACE_ME

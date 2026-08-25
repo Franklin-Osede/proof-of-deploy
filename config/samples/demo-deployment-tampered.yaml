@@ -1,0 +1,76 @@
+# DEMO ONLY — the point of this file is to FAIL to be detected.
+#
+# Every field that participates in the config hash is byte-identical to
+# demo-deployment.yaml: same namespace, name, labels, replicas, selector, pod
+# template labels, container name, image, env NAMES, and resources.
+#
+# Everything that differs is outside the attested surface, so this Deployment
+# produces the SAME config hash and pod-verify reports PASS — while running a
+# different command, as root, privileged, with the host filesystem mounted, and
+# under a different ServiceAccount.
+#
+# This is the concrete demonstration of README "What fields are excluded and
+# why". Do not treat a PASS as evidence about any of these fields.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: overprivileged
+  namespace: demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: demo
+  labels:
+    app: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      # NOT hashed: a different identity in the cluster.
+      serviceAccountName: overprivileged
+      # NOT hashed: host namespace access.
+      hostPID: true
+      # NOT hashed: an init container that could do anything before the app runs.
+      initContainers:
+        - name: setup
+          image: busybox:1.36
+          command: ["sh", "-c", "echo 'this init step is invisible to the config hash'"]
+      containers:
+        - name: server
+          image: registry.k8s.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097
+          # NOT hashed: a different program entirely, from the same image.
+          command: ["/pause"]
+          args: ["--not-what-was-reviewed"]
+          env:
+            # Name is hashed; the VALUE is excluded by design so Secrets never
+            # reach the chain. Changing it is invisible to the hash.
+            - name: LOG_LEVEL
+              value: trace
+          # NOT hashed: privilege escalation.
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+          # NOT hashed: the host root filesystem, mounted read-write.
+          volumeMounts:
+            - name: hostroot
+              mountPath: /host
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      volumes:
+        - name: hostroot
+          hostPath:
+            path: /

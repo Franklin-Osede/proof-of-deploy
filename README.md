@@ -238,6 +238,13 @@ guarantee. Neither exists yet.
 | `cmd/verify` | the `pod-verify` CLI — deliberately not shipped in the operator image |
 | `contracts` | `AttestationRegistry.sol` and its Hardhat tests |
 
+## Running it locally
+
+`docs/local-demo.md` walks a clean checkout through to a receipt-confirmed
+`PASS` with no AWS account, no testnet and no cost: LocalStack stands in for KMS
+and a Hardhat node for the chain, neither of which needs a code change. It ends
+with two deliberate changes — one the hash detects, and one it does not.
+
 ## Building
 
 ```sh
@@ -296,6 +303,8 @@ Honest inventory of what is missing, roughly in priority order.
   There are no metrics for queue depth, signing, or publication.
 - `pod-verify` exits `1` for both a semantic FAIL and an operational error, and
   prints a failure to stdout and stderr both.
+- `pod-verify` has no `--context` flag and silently uses the current kubeconfig
+  context, so on a multi-cluster machine it can verify the wrong cluster.
 - Hardhat falls back to a live public RPC when `RPC_URL` is unset.
 
 **Testing and tooling**
@@ -303,10 +312,9 @@ Honest inventory of what is missing, roughly in priority order.
 - The Go ABI constant in `internal/chain/registry.go` is hand-maintained with no
   check against the compiled artifact.
 - No `contracts/package-lock.json`, so CI cannot use `npm ci`.
-- No sample workload, no example Secret, no kind overlay. **The end-to-end path
-  from a clean checkout to a `PASS` has not been executed and is not documented
-  here yet** — the first target should be kind plus a local Hardhat/Anvil node,
-  not Base Sepolia.
+- The local end-to-end path is documented and has been executed (see
+  `docs/local-demo.md`), but nothing runs it automatically: there is no e2e job
+  in CI, so it can rot silently.
 
 **Before this is more than a demo**, at minimum: a versioned protocol, a
 defensible hash surface, delivery reconciled through receipt and finality,

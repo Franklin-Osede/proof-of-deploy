@@ -1,0 +1,7 @@
+# Local demo cluster. Single node is enough: the operator only watches
+# Deployments, and the workload it attests is a trivial one.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: proof-of-deploy
+nodes:
+  - role: control-plane

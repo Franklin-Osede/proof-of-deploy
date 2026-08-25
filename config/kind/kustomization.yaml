@@ -1,0 +1,19 @@
+# Overlay for a locally built image loaded into a kind cluster with
+#   kind load docker-image proof-of-deploy:latest --name proof-of-deploy
+#
+# kind nodes have no registry credentials and the image exists only in the
+# node's containerd store, so the pull policy must not force a registry pull.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../default
+
+patches:
+  - target:
+      kind: Deployment
+      name: controller-manager
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
