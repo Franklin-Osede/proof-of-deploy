@@ -87,9 +87,9 @@ PASS  demo/api
   signer fingerprint: 73e6f050...
 ```
 
-> `pod-verify` has no `--context` flag and uses your current kubeconfig context.
-> On a machine with several clusters, pass `--kubeconfig` with a file scoped to
-> the right cluster (`kind get kubeconfig --name proof-of-deploy > /tmp/kc`).
+> On a machine with several clusters, pass `--context kind-proof-of-deploy`.
+> Without it the CLI follows whatever context is currently active. The PASS
+> output names the cluster it actually read, so check that line.
 
 ## 6. The two demonstrations
 

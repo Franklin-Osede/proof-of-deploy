@@ -331,8 +331,6 @@ Honest inventory of what is missing, roughly in priority order.
   There are no metrics for queue depth, signing, or publication.
 - `pod-verify` exits `1` for both a semantic FAIL and an operational error, and
   prints a failure to stdout and stderr both.
-- `pod-verify` has no `--context` flag and silently uses the current kubeconfig
-  context, so on a multi-cluster machine it can verify the wrong cluster.
 - Hardhat falls back to a live public RPC when `RPC_URL` is unset.
 
 **Testing and tooling**

@@ -44,6 +44,7 @@ import (
 
 type options struct {
 	kubeconfig    string
+	kubecontext   string
 	namespace     string
 	name          string
 	rpcURL        string
@@ -70,6 +71,7 @@ func main() {
 	}
 	f := verifyCmd.Flags()
 	f.StringVar(&opts.kubeconfig, "kubeconfig", "", "Path to kubeconfig (defaults to standard loading rules)")
+	f.StringVar(&opts.kubecontext, "context", "", "kubeconfig context to use (defaults to the current context)")
 	f.StringVarP(&opts.namespace, "namespace", "n", "", "Deployment namespace (required)")
 	f.StringVar(&opts.name, "name", "", "Deployment name (required)")
 	f.StringVar(&opts.rpcURL, "eth-rpc-url", os.Getenv("ETH_RPC_URL"), "Testnet JSON-RPC endpoint (required)")
@@ -93,7 +95,7 @@ func runVerify(ctx context.Context, o *options) error {
 	}
 
 	// 1. Read the live Deployment.
-	dep, err := getDeployment(ctx, o.kubeconfig, o.namespace, o.name)
+	dep, cluster, err := getDeployment(ctx, o, o.namespace, o.name)
 	if err != nil {
 		return fmt.Errorf("reading deployment: %w", err)
 	}
@@ -146,6 +148,7 @@ func runVerify(ctx context.Context, o *options) error {
 	}
 
 	fmt.Printf("PASS  %s/%s\n", o.namespace, o.name)
+	fmt.Printf("  cluster:            %s\n", cluster)
 	fmt.Printf("  config hash:        %s\n", attest.MustHex(localHash))
 	fmt.Printf("  signer fingerprint: %s\n", attest.MustHex(att.SignerFingerprint))
 	fmt.Printf("  block timestamp:    %d\n", att.BlockTimestamp)
@@ -165,21 +168,46 @@ func fail(format string, args ...interface{}) error {
 	return failErr{msg: msg}
 }
 
-func getDeployment(ctx context.Context, kubeconfig, namespace, name string) (*appsv1.Deployment, error) {
+// getDeployment reads the live Deployment and also reports which cluster it was
+// read from. Without --context the CLI follows whatever context happens to be
+// current, which on a multi-cluster machine can silently verify the wrong
+// cluster; returning the endpoint lets the result say what it actually checked.
+func getDeployment(ctx context.Context, o *options, namespace, name string) (*appsv1.Deployment, string, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if kubeconfig != "" {
-		loadingRules.ExplicitPath = kubeconfig
+	if o.kubeconfig != "" {
+		loadingRules.ExplicitPath = o.kubeconfig
 	}
-	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		loadingRules, &clientcmd.ConfigOverrides{}).ClientConfig()
+	overrides := &clientcmd.ConfigOverrides{}
+	if o.kubecontext != "" {
+		overrides.CurrentContext = o.kubecontext
+	}
+	deferred := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides)
+
+	cfg, err := deferred.ClientConfig()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+
+	cluster := cfg.Host
+	if raw, err := deferred.RawConfig(); err == nil {
+		name := o.kubecontext
+		if name == "" {
+			name = raw.CurrentContext
+		}
+		if name != "" {
+			cluster = fmt.Sprintf("%s (%s)", name, cfg.Host)
+		}
+	}
+
+	dep, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, cluster, err
+	}
+	return dep, cluster, nil
 }
 
 // loadPublicKey returns the signer's DER SubjectPublicKeyInfo, either from a
