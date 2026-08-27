@@ -83,9 +83,14 @@ Expected:
 
 ```
 PASS  demo/api
-  config hash:        ba7e7ec9...
-  signer fingerprint: 73e6f050...
+  cluster:            kind-proof-of-deploy (https://127.0.0.1:PORT)
+  config hash:        89ab57526b689c52761431af4bc5451933c1947b74e0db262438ad1881c17a77
+  signer fingerprint: <depends on the key you created in step 1>
 ```
+
+The config hash is fixed by the manifest and is pinned as a golden vector
+(`internal/attest/testdata/08-v1-weakness-benign`), so it should match exactly.
+The fingerprint is whatever LocalStack minted for you and differs every run.
 
 > On a machine with several clusters, pass `--context kind-proof-of-deploy`.
 > Without it the CLI follows whatever context is currently active. The PASS

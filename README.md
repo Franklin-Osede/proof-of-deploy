@@ -218,10 +218,20 @@ A diff in any golden file is a protocol change. Regenerate deliberately:
 go test ./internal/attest -run TestGolden -update
 ```
 
-Three tests assert behaviour that is **wrong on purpose**: the benign/tampered
-pair that hashes alike, and the two determinism defects above. Each is written
-to fail once the defect is fixed, so the fix has to be a conscious, versioned
-decision rather than a silent one.
+One test asserts behaviour that is **wrong on purpose**: the benign/tampered
+pair that hashes alike. It is written to fail once the hash surface is widened,
+so closing that hole has to be a conscious, versioned decision rather than a
+silent one.
+
+Writing these fixtures surfaced two determinism defects, both since fixed:
+`matchExpressions` sorted with no tiebreak on `values`, so declaration order
+leaked into the hash; and quantities were canonicalized by
+`resource.Quantity`'s format rather than its value, so `1Gi` and `1073741824`
+hashed differently despite being the same number of bytes. Both produced the
+mirror image of the weakness above — a false FAIL on a change that means
+nothing. They are now regression-tested by
+`TestSelectorRequirementOrderIsDeterministic` and
+`TestQuantityCanonicalizationIsByValue`.
 
 ## Hash versioning
 
@@ -316,15 +326,6 @@ Honest inventory of what is missing, roughly in priority order.
 - `internal/signer` validates `KeyUsage` but not `KeySpec`, so a non-P-256 key
   fails late instead of at startup. `PublicKeyDER()` returns its internal slice
   uncopied.
-- **The hash is not fully deterministic.** Two defects, both pinned by tests in
-  `internal/attest/golden_test.go`:
-  - `matchExpressions` sorts by `(key, operator)` with no tiebreak on `values`,
-    so two requirements sharing a key and operator keep their declaration order
-    and the hash depends on how the manifest was written.
-  - Quantities are canonicalized by `resource.Quantity`'s **format**, not its
-    **value**. `1Gi`, `1024Mi` and `1048576Ki` all hash alike, but the identical
-    number of bytes written as `1073741824` hashes differently. This is the
-    inverse of the surface weakness above: it produces a false FAIL.
 - `Selector.MatchLabels` is not filtered through the generated-label denylist,
   while pod template labels are.
 - Readiness is `healthz.Ping`: a permanently failing pipeline reports Ready.

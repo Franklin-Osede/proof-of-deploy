@@ -3,9 +3,11 @@
 # privileged, root, host PID namespace, host root filesystem mounted, a
 # different ServiceAccount, a different command, and an extra init container.
 #
-# This was demonstrated on a live kind cluster: both produced config hash
-# ba7e7ec92009989aedd7b2efa630f126ee5622fad6ccb3d1214e24aaec15e2f8 and both
-# verified as PASS. See docs/local-demo.md.
+# This was demonstrated on a live kind cluster: both spellings of the workload
+# produced one identical config hash and both verified as PASS. See
+# docs/local-demo.md. (The hash value itself changed afterwards, when quantity
+# canonicalization was fixed to compare by value; the equality demonstrated
+# here did not.)
 #
 # The equality asserted here is NOT a desirable property. It is v1's documented
 # blind spot, pinned so that widening the surface in v2 must consciously break

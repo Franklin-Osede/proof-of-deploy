@@ -372,33 +372,32 @@ func mustWrite(t *testing.T, path string, b []byte) {
 	}
 }
 
-// --- pinned determinism defects ---------------------------------------------
+// --- determinism ------------------------------------------------------------
 //
-// The two tests below assert behaviour that is WRONG. They exist so the defects
-// are visible, regression-tested and impossible to fix by accident. Like
-// TestV1WeaknessIsPinned, each is written to FAIL once the defect is fixed;
-// that failure is the signal to invert the assertion under a new protocol
-// version, not to delete the test.
+// Both properties below were defects found while writing the golden fixtures,
+// and were briefly pinned as such. They are now fixed, and these tests assert
+// the corrected behaviour: equal inputs must produce equal hashes, whatever
+// notation or declaration order the manifest happened to use.
+//
+// The failure they guard against is the mirror image of the v1 surface
+// weakness. That one yields a false PASS; these yield a false FAIL, where
+// verification breaks on a change that means nothing operationally.
 
-// TestQuantityCanonicalizationIsFormatNotValue pins that the hash follows
-// resource.Quantity's FORMAT rather than its VALUE.
+// TestQuantityCanonicalizationIsByValue asserts that resource quantities are
+// hashed by value rather than by the notation they were written in.
 //
-// 1Gi, 1024Mi and 1048576Ki all canonicalize to "1Gi", but the same number of
-// bytes written as the plain integer 1073741824 stays "1073741824" because it
-// parses as DecimalSI rather than BinarySI. Two Deployments requesting exactly
-// the same memory therefore hash differently.
-//
-// This is the inverse of the v1 weakness: it produces a false FAIL. Rewriting
-// "1Gi" as "1073741824" in a manifest changes nothing operationally and breaks
-// verification.
-func TestQuantityCanonicalizationIsFormatNotValue(t *testing.T) {
+// resource.Quantity.String() is format-preserving and caches the parsed text,
+// so it renders "1Gi", "1024Mi" and "1048576Ki" alike but leaves the identical
+// number of bytes written as "1073741824" untouched. canonicalQuantity takes
+// the exact decimal and strips trailing zeros instead, giving one string per
+// value.
+func TestQuantityCanonicalizationIsByValue(t *testing.T) {
 	hashFor := func(mem string) [32]byte {
-		q := resource.MustParse(mem)
 		d := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "n", Name: "x"},
 			Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
 				Containers: []corev1.Container{{Name: "c", Image: "i", Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{corev1.ResourceMemory: q},
+					Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(mem)},
 				}}},
 			}}},
 		}
@@ -409,31 +408,53 @@ func TestQuantityCanonicalizationIsFormatNotValue(t *testing.T) {
 		return h
 	}
 
-	// Sanity: all four spellings are the same number of bytes.
-	for _, f := range []string{"1Gi", "1024Mi", "1048576Ki", "1073741824"} {
-		q := resource.MustParse(f)
-		if got := q.Value(); got != 1073741824 {
-			t.Fatalf("%s is %d bytes, expected the fixture to use equal values", f, got)
+	equivalent := [][]string{
+		{"1Gi", "1024Mi", "1048576Ki", "1073741824"},
+		{"2G", "2000M", "2000000000"},
+		{"1.5Gi", "1610612736"},
+		{"0", "0m", "0Ki"},
+	}
+	for _, group := range equivalent {
+		// Guard the fixture itself: these must really be the same quantity.
+		first := resource.MustParse(group[0])
+		want := hashFor(group[0])
+		for _, spelling := range group[1:] {
+			q := resource.MustParse(spelling)
+			if q.Cmp(first) != 0 {
+				t.Fatalf("fixture error: %s and %s are not the same quantity", group[0], spelling)
+			}
+			if got := hashFor(spelling); got != want {
+				t.Errorf("%s and %s are the same quantity but hash differently", group[0], spelling)
+			}
 		}
 	}
 
-	binary := hashFor("1Gi")
-	if hashFor("1024Mi") != binary || hashFor("1048576Ki") != binary {
-		t.Error("binary-suffixed spellings no longer agree with each other")
+	// CPU is the case where a value-based encoding is easiest to get wrong:
+	// collapsing to whole units would erase millicores entirely.
+	cpu := func(v string) string { return canonicalQuantity(resource.MustParse(v)) }
+	if cpu("250m") != cpu("0.25") {
+		t.Error("250m and 0.25 are the same CPU request but canonicalize differently")
 	}
-	if hashFor("1073741824") == binary {
-		t.Fatal("quantities are now canonicalized by value, not format.\n" +
-			"That is the desired behaviour: bump the protocol version and assert\n" +
-			"equality here instead of inequality.")
+	if cpu("250m") == cpu("0") {
+		t.Error("millicores collapsed to zero; the encoding lost sub-unit precision")
 	}
-	t.Log("v1 confirmed: equal memory quantities hash differently when spelled as a plain integer")
+	if cpu("1") != cpu("1000m") {
+		t.Error("1 and 1000m are the same CPU request but canonicalize differently")
+	}
+	// Distinct values must stay distinct.
+	if cpu("250m") == cpu("251m") {
+		t.Error("distinct CPU quantities collapsed to the same string")
+	}
+	if canonicalQuantity(resource.MustParse("1Gi")) == canonicalQuantity(resource.MustParse("1G")) {
+		t.Error("1Gi and 1G are different amounts but canonicalize the same")
+	}
 }
 
-// TestSelectorRequirementOrderIsNotDeterministic pins that normalizeSelector
-// sorts matchExpressions by (key, operator) with no tiebreak on values, so two
-// requirements sharing a key and operator keep their declaration order and the
-// hash depends on how the manifest was written.
-func TestSelectorRequirementOrderIsNotDeterministic(t *testing.T) {
+// TestSelectorRequirementOrderIsDeterministic asserts that matchExpressions
+// sort fully, including a tiebreak on values. Without it, two requirements
+// sharing a key and operator keep the order they were declared in and the hash
+// depends on how the manifest was written.
+func TestSelectorRequirementOrderIsDeterministic(t *testing.T) {
 	hashFor := func(reqs ...metav1.LabelSelectorRequirement) [32]byte {
 		d := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "n", Name: "x"},
@@ -449,13 +470,36 @@ func TestSelectorRequirementOrderIsNotDeterministic(t *testing.T) {
 		}
 		return h
 	}
-	a := metav1.LabelSelectorRequirement{Key: "zone", Operator: metav1.LabelSelectorOpIn, Values: []string{"aaa"}}
-	b := metav1.LabelSelectorRequirement{Key: "zone", Operator: metav1.LabelSelectorOpIn, Values: []string{"zzz"}}
-
-	if hashFor(a, b) == hashFor(b, a) {
-		t.Fatal("matchExpressions now sort deterministically across equal (key, operator).\n" +
-			"That is the desired behaviour: bump the protocol version and assert\n" +
-			"equality here instead of inequality.")
+	in := func(key string, vals ...string) metav1.LabelSelectorRequirement {
+		return metav1.LabelSelectorRequirement{Key: key, Operator: metav1.LabelSelectorOpIn, Values: vals}
 	}
-	t.Log("v1 confirmed: matchExpressions declaration order leaks into the hash when key and operator match")
+
+	// Same key and operator, different values: the case with no tiebreak.
+	a, b := in("zone", "aaa"), in("zone", "zzz")
+	if hashFor(a, b) != hashFor(b, a) {
+		t.Error("declaration order of two same-key same-operator requirements still changes the hash")
+	}
+
+	// One value list a prefix of the other: exercises the length fallback.
+	short, long := in("zone", "eu"), in("zone", "eu", "eu-west-1")
+	if hashFor(short, long) != hashFor(long, short) {
+		t.Error("declaration order changes the hash when one value list prefixes the other")
+	}
+
+	// Three-way permutations must all agree.
+	c := in("zone", "mmm")
+	want := hashFor(a, b, c)
+	for _, perm := range [][]metav1.LabelSelectorRequirement{
+		{a, c, b}, {b, a, c}, {b, c, a}, {c, a, b}, {c, b, a},
+	} {
+		if hashFor(perm...) != want {
+			t.Error("some permutation of equal-key requirements hashes differently")
+			break
+		}
+	}
+
+	// Genuinely different selectors must still differ.
+	if hashFor(a, b) == hashFor(a, c) {
+		t.Error("different selector values produced the same hash")
+	}
 }

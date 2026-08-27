@@ -17,10 +17,13 @@ limitations under the License.
 package attest
 
 import (
+	"math/big"
 	"sort"
 
+	"gopkg.in/inf.v0"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -109,11 +112,19 @@ func normalizeSelector(sel *metav1.LabelSelector) NormalizedSelector {
 			Values:   values,
 		})
 	}
+	// Sorted by key, then operator, then values. The values tiebreak matters:
+	// without it two requirements sharing a key and operator keep the order
+	// they were declared in, and the hash silently depends on how the manifest
+	// was written.
 	sort.Slice(ns.MatchExpressions, func(i, j int) bool {
-		if ns.MatchExpressions[i].Key != ns.MatchExpressions[j].Key {
-			return ns.MatchExpressions[i].Key < ns.MatchExpressions[j].Key
+		a, b := ns.MatchExpressions[i], ns.MatchExpressions[j]
+		if a.Key != b.Key {
+			return a.Key < b.Key
 		}
-		return ns.MatchExpressions[i].Operator < ns.MatchExpressions[j].Operator
+		if a.Operator != b.Operator {
+			return a.Operator < b.Operator
+		}
+		return lessStrings(a.Values, b.Values)
 	})
 	return ns
 }
@@ -149,9 +160,8 @@ func envNames(env []corev1.EnvVar) []string {
 }
 
 // normalizeResources converts requests/limits into canonical quantity strings.
-// resource.Quantity.String() yields a stable canonical form (e.g. "0.25" ->
-// "250m"), and encoding/json sorts the resulting map keys, so the output is
-// deterministic without further work.
+// encoding/json sorts the resulting map keys, so the output is deterministic
+// without further work.
 func normalizeResources(r corev1.ResourceRequirements) NormalizedResources {
 	return NormalizedResources{
 		Requests: quantityMap(r.Requests),
@@ -162,9 +172,56 @@ func normalizeResources(r corev1.ResourceRequirements) NormalizedResources {
 func quantityMap(rl corev1.ResourceList) map[string]string {
 	out := make(map[string]string, len(rl))
 	for name, q := range rl {
-		// Copy to take a stable canonical string without mutating the input.
-		qc := q.DeepCopy()
-		out[string(name)] = qc.String()
+		out[string(name)] = canonicalQuantity(q)
 	}
 	return out
+}
+
+// canonicalQuantity renders a resource quantity by VALUE, not by the notation
+// its author happened to use.
+//
+// resource.Quantity.String() is format-preserving: it keeps the suffix family
+// the value was parsed with, and it caches the original string. So "1Gi",
+// "1024Mi" and "1048576Ki" all render as "1Gi", while the identical number of
+// bytes written as the plain integer "1073741824" renders as "1073741824".
+// Hashing that output means two Deployments requesting exactly the same
+// resources can hash differently -- a spurious verification failure caused by
+// nothing but how someone typed a manifest.
+//
+// AsDec() is value-based but scale-preserving: "250m" becomes "0.250" while
+// "0.25" becomes "0.25". So we take the exact decimal and then strip trailing
+// zeros from the fractional part, which yields one representation per value.
+// big.Int arithmetic keeps this exact; MilliValue() would saturate on overflow
+// and silently collide distinct values.
+func canonicalQuantity(q resource.Quantity) string {
+	dec := q.AsDec()
+	unscaled := new(big.Int).Set(dec.UnscaledBig())
+	scale := dec.Scale()
+
+	ten := big.NewInt(10)
+	rem := new(big.Int)
+	for scale > 0 && unscaled.Sign() != 0 {
+		quo := new(big.Int)
+		quo.QuoRem(unscaled, ten, rem)
+		if rem.Sign() != 0 {
+			break
+		}
+		unscaled = quo
+		scale--
+	}
+	if unscaled.Sign() == 0 {
+		return "0"
+	}
+	return inf.NewDecBig(unscaled, scale).String()
+}
+
+// lessStrings orders two string slices lexicographically, element by element,
+// with the shorter slice first when one is a prefix of the other.
+func lessStrings(a, b []string) bool {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return len(a) < len(b)
 }
