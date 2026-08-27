@@ -100,15 +100,11 @@ func runVerify(ctx context.Context, o *options) error {
 		return fmt.Errorf("reading deployment: %w", err)
 	}
 
-	// 2. Normalize + hash with the SAME code path the operator uses.
-	nd := attest.Normalize(dep)
-	localHash, err := attest.ConfigHash(nd)
-	if err != nil {
-		return fmt.Errorf("hashing deployment: %w", err)
-	}
+	// 2. Fetch the latest on-chain attestation FIRST. The record carries the
+	// hash protocol version, and we cannot recompute anything until we know
+	// which normalizer to run. Hashing first and then discovering the version
+	// would mean guessing.
 	id := attest.DeploymentID(o.namespace, o.name)
-
-	// 3. Fetch the latest on-chain attestation.
 	reader, err := chain.NewReader(ctx, o.rpcURL, o.contractAddr)
 	if err != nil {
 		return err
@@ -122,13 +118,29 @@ func runVerify(ctx context.Context, o *options) error {
 		return fail("no attestation found on-chain for %s/%s", o.namespace, o.name)
 	}
 
-	// 4. Hash match.
+	// 3. Refuse versions this build does not implement. This is deliberately a
+	// hard error and never a fallback: trying each known version until one
+	// verifies would let anyone able to write on-chain downgrade a verifier
+	// onto a weaker hash surface just by relabelling a record.
+	version := attest.Version(att.HashVersion)
+	if !version.Supported() {
+		return fmt.Errorf("on-chain record uses %w", attest.ErrUnknownVersion{Version: version})
+	}
+
+	// 4. Normalize + hash with the SAME code path the operator used, under the
+	// version the record declares.
+	localHash, err := attest.ConfigHashForVersion(version, dep)
+	if err != nil {
+		return fmt.Errorf("hashing deployment: %w", err)
+	}
+
+	// 5. Hash match.
 	if localHash != att.ConfigHash {
 		return fail("config hash mismatch\n  live:    %s\n  onchain: %s\n  the running Deployment differs from the attested state",
 			attest.MustHex(localHash), attest.MustHex(att.ConfigHash))
 	}
 
-	// 5. Confirm the attestation was signed by the expected key.
+	// 6. Confirm the attestation was signed by the expected key.
 	pubDER, err := loadPublicKey(ctx, o)
 	if err != nil {
 		return fmt.Errorf("loading signer public key: %w", err)
@@ -138,21 +150,32 @@ func runVerify(ctx context.Context, o *options) error {
 			attest.MustHex(got), attest.MustHex(att.SignerFingerprint))
 	}
 
-	// 6. Verify the signature over the hash.
+	// 7. Verify the signature over the version-bound digest. Binding the
+	// version means a record whose version field was altered fails here rather
+	// than being silently recomputed under the wrong normalizer.
 	pub, err := attest.ParsePublicKeyDER(pubDER)
 	if err != nil {
 		return fmt.Errorf("parsing signer public key: %w", err)
 	}
-	if !attest.VerifyConfigHashSignature(pub, localHash, att.Signature) {
+	if !attest.VerifyConfigHashSignature(pub, attest.SigningDigest(version, localHash), att.Signature) {
 		return fail("signature verification failed for the attested config hash")
 	}
 
 	fmt.Printf("PASS  %s/%s\n", o.namespace, o.name)
 	fmt.Printf("  cluster:            %s\n", cluster)
+	fmt.Printf("  hash protocol:      %s\n", version)
 	fmt.Printf("  config hash:        %s\n", attest.MustHex(localHash))
 	fmt.Printf("  signer fingerprint: %s\n", attest.MustHex(att.SignerFingerprint))
 	fmt.Printf("  block timestamp:    %d\n", att.BlockTimestamp)
 	fmt.Println("  the live Deployment matches a signature recorded on-chain by the expected key.")
+	if version.IsWeakSurface() {
+		fmt.Println()
+		fmt.Printf("  WARNING: %s hashes a narrow subset of the Deployment. It does NOT cover\n", version)
+		fmt.Println("  command, args, initContainers, securityContext, volumes, mounts,")
+		fmt.Println("  envFrom/valueFrom, serviceAccountName or host namespaces. A materially")
+		fmt.Println("  more privileged workload can produce this same PASS.")
+		fmt.Println("  See README \"What fields are excluded and why\".")
+	}
 	return nil
 }
 

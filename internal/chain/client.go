@@ -41,7 +41,11 @@ type Attestation struct {
 	Signature         []byte
 	SignerFingerprint [32]byte
 	BlockTimestamp    uint64
-	Exists            bool
+	// HashVersion is which off-chain protocol produced ConfigHash. It is kept
+	// as a raw uint16 so this package stays a transport: interpreting it, and
+	// refusing versions it does not implement, is the caller's job.
+	HashVersion uint16
+	Exists      bool
 }
 
 // Client wraps a bound AttestationRegistry contract. When auth is nil the
@@ -95,13 +99,18 @@ func NewWriter(ctx context.Context, rpcURL, contractAddr, privHex string, chainI
 // PublishAttestation submits a publish transaction and returns the tx hash. It
 // returns once the transaction is sent (not mined); the publisher's retry loop
 // is responsible for resubmission on send failure.
-func (c *Client) PublishAttestation(ctx context.Context, deploymentID, configHash [32]byte, signature []byte, fingerprint [32]byte) (string, error) {
+func (c *Client) PublishAttestation(ctx context.Context, deploymentID [32]byte, hashVersion uint16, configHash [32]byte, signature []byte, fingerprint [32]byte) (string, error) {
 	if c.auth == nil {
 		return "", fmt.Errorf("chain: client is read-only; no signing key configured")
 	}
+	if hashVersion == 0 {
+		// The contract rejects this too, but failing here keeps the wasted gas
+		// and the confusing revert out of the picture entirely.
+		return "", fmt.Errorf("chain: hash version 0 is not a valid protocol version")
+	}
 	opts := *c.auth
 	opts.Context = ctx
-	tx, err := c.contract.Transact(&opts, "publish", deploymentID, configHash, signature, fingerprint)
+	tx, err := c.contract.Transact(&opts, "publish", deploymentID, hashVersion, configHash, signature, fingerprint)
 	if err != nil {
 		return "", fmt.Errorf("chain: publish tx: %w", err)
 	}
@@ -115,8 +124,8 @@ func (c *Client) LatestAttestation(ctx context.Context, deploymentID [32]byte) (
 	if err := c.contract.Call(&bind.CallOpts{Context: ctx}, &out, "getLatest", deploymentID); err != nil {
 		return Attestation{}, fmt.Errorf("chain: getLatest: %w", err)
 	}
-	if len(out) != 5 {
-		return Attestation{}, fmt.Errorf("chain: getLatest returned %d values, want 5", len(out))
+	if len(out) != 6 {
+		return Attestation{}, fmt.Errorf("chain: getLatest returned %d values, want 6", len(out))
 	}
 
 	att := Attestation{}
@@ -133,8 +142,11 @@ func (c *Client) LatestAttestation(ctx context.Context, deploymentID [32]byte) (
 	if att.BlockTimestamp, ok = out[3].(uint64); !ok {
 		return Attestation{}, typeErr("blockTimestamp", out[3])
 	}
-	if att.Exists, ok = out[4].(bool); !ok {
-		return Attestation{}, typeErr("exists", out[4])
+	if att.HashVersion, ok = out[4].(uint16); !ok {
+		return Attestation{}, typeErr("hashVersion", out[4])
+	}
+	if att.Exists, ok = out[5].(bool); !ok {
+		return Attestation{}, typeErr("exists", out[5])
 	}
 	return att, nil
 }

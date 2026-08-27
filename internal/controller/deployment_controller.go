@@ -102,8 +102,7 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	nd := attest.Normalize(&dep)
-	configHash, err := attest.ConfigHash(nd)
+	configHash, err := attest.ConfigHashForVersion(attest.CurrentVersion, &dep)
 	if err != nil {
 		// Hashing a struct we control should not fail; if it ever does, log and
 		// move on rather than wedging the reconcile loop.
@@ -121,11 +120,13 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	r.recordAttested(id, configHash)
 	r.Publisher.Enqueue(publisher.Job{
 		DeploymentID:   id,
+		Version:        attest.CurrentVersion,
 		ConfigHash:     configHash,
 		NamespacedName: req.NamespacedName.String(),
 	})
 	log.Info("enqueued attestation for converged deployment",
 		"deployment", req.NamespacedName.String(),
+		"hashVersion", attest.CurrentVersion.String(),
 		"configHash", attest.MustHex(configHash),
 	)
 	return ctrl.Result{}, nil

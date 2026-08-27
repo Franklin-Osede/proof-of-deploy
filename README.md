@@ -203,6 +203,31 @@ and redistributing its address to every consumer.
 
 ---
 
+## Hash protocol versions
+
+Every attestation records which hash protocol produced it. The version is stored
+**on-chain**, next to the config hash, because a verifier recomputes the hash
+from the live Deployment and therefore has to know which normalizer to run
+before it can produce any bytes to compare. A version living only inside the
+hashed payload would be unreachable at exactly the moment it is needed, and
+inferring it from the payload's shape would misverify as soon as two versions
+became shape-compatible.
+
+The version is also bound into the signed digest
+(`SHA-256(domain || version || configHash)`), so altering the stored version
+breaks signature verification rather than silently selecting the wrong
+normalizer.
+
+`pod-verify` **refuses** versions it does not implement. It never tries each in
+turn: falling back would let anyone able to write on-chain steer a verifier onto
+a weaker hash surface by relabelling a record.
+
+| Version | Surface |
+|---|---|
+| `v1` | current. Narrow — see [What fields are excluded and why](#what-fields-are-excluded-and-why). Every `v1` PASS prints a warning saying so. |
+
+See `docs/adr/0001-hash-protocol-v2.md` for the proposed v2.
+
 ## Golden vectors
 
 `internal/attest/testdata` freezes the v1 wire format: for each fixture, the
@@ -336,8 +361,6 @@ Honest inventory of what is missing, roughly in priority order.
 
 **Testing and tooling**
 - No tests for the publisher, signer, chain client, or CLI.
-- The Go ABI constant in `internal/chain/registry.go` is hand-maintained with no
-  check against the compiled artifact.
 - No `contracts/package-lock.json`, so CI cannot use `npm ci`.
 - The local end-to-end path is documented and has been executed (see
   `docs/local-demo.md`), but nothing runs it automatically: there is no e2e job

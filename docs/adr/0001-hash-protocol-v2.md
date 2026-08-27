@@ -1,7 +1,13 @@
 # ADR 0001 — Versioning the hash protocol and defining v2
 
-**Status:** proposed
+**Status:** Decision 0 implemented. Decisions 1–4 proposed.
 **Supersedes:** nothing. v1 is the format frozen in `internal/attest/testdata`.
+
+> Decision 0 (version representation) is implemented: the contract stores
+> `hashVersion`, the signed digest binds it, and the verifier refuses versions
+> it does not implement. The v1 hash surface is unchanged — Decisions 1–4 are
+> still open, and the surface list in Decision 1 is the part most worth
+> arguing with before any of it is written.
 
 ## Context
 

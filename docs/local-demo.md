@@ -84,9 +84,16 @@ Expected:
 ```
 PASS  demo/api
   cluster:            kind-proof-of-deploy (https://127.0.0.1:PORT)
+  hash protocol:      v1
   config hash:        89ab57526b689c52761431af4bc5451933c1947b74e0db262438ad1881c17a77
   signer fingerprint: <depends on the key you created in step 1>
+  ...
+
+  WARNING: v1 hashes a narrow subset of the Deployment. ...
 ```
+
+The warning is not incidental. It is printed on every v1 `PASS` precisely
+because of what step 6 below demonstrates.
 
 The config hash is fixed by the manifest and is pinned as a golden vector
 (`internal/attest/testdata/08-v1-weakness-benign`), so it should match exactly.

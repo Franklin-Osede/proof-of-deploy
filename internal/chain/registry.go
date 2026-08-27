@@ -23,7 +23,8 @@ package chain
 // hand-maintained ABI constant and a thin typed wrapper in client.go; this
 // avoids committing a large generated file while keeping the Go ⇄ Solidity
 // contract explicit and reviewable. The ABI here MUST stay in sync with the
-// Solidity source — the Hardhat tests are the authority on the contract shape.
+// Solidity source; TestABIMatchesCompiledArtifact enforces that against the
+// compiled Hardhat artifact rather than trusting a comment to do it.
 const RegistryABI = `[
   {
     "type": "function",
@@ -31,6 +32,7 @@ const RegistryABI = `[
     "stateMutability": "nonpayable",
     "inputs": [
       { "name": "deploymentId", "type": "bytes32" },
+      { "name": "hashVersion", "type": "uint16" },
       { "name": "configHash", "type": "bytes32" },
       { "name": "signature", "type": "bytes" },
       { "name": "signerFingerprint", "type": "bytes32" }
@@ -47,6 +49,7 @@ const RegistryABI = `[
       { "name": "signature", "type": "bytes" },
       { "name": "signerFingerprint", "type": "bytes32" },
       { "name": "blockTimestamp", "type": "uint64" },
+      { "name": "hashVersion", "type": "uint16" },
       { "name": "exists", "type": "bool" }
     ]
   },
@@ -56,6 +59,7 @@ const RegistryABI = `[
     "anonymous": false,
     "inputs": [
       { "name": "deploymentId", "type": "bytes32", "indexed": true },
+      { "name": "hashVersion", "type": "uint16", "indexed": true },
       { "name": "configHash", "type": "bytes32", "indexed": false },
       { "name": "signerFingerprint", "type": "bytes32", "indexed": false },
       { "name": "blockTimestamp", "type": "uint64", "indexed": false }

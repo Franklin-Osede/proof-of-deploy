@@ -40,13 +40,17 @@ type Signer interface {
 
 // ChainWriter is the subset of the chain client the publisher needs.
 type ChainWriter interface {
-	PublishAttestation(ctx context.Context, deploymentID, configHash [32]byte, signature []byte, fingerprint [32]byte) (string, error)
+	PublishAttestation(ctx context.Context, deploymentID [32]byte, hashVersion uint16, configHash [32]byte, signature []byte, fingerprint [32]byte) (string, error)
 }
 
 // Job is the unit of work enqueued by the reconciler. All fields are comparable
 // so the work queue naturally coalesces duplicate enqueues of the same state.
 type Job struct {
-	DeploymentID   [32]byte
+	DeploymentID [32]byte
+	// Version is the hash protocol that produced ConfigHash. It is carried on
+	// the job rather than read from a global so that a queued job keeps the
+	// version it was built under, even across a protocol upgrade.
+	Version        attest.Version
 	ConfigHash     [32]byte
 	NamespacedName string // for logs only; not hashed or published
 }
@@ -120,18 +124,22 @@ func (p *Publisher) processNext(ctx context.Context) bool {
 }
 
 func (p *Publisher) process(ctx context.Context, job Job) error {
-	sig, err := p.signer.SignDigest(ctx, job.ConfigHash)
+	// Sign the version-bound digest, not the bare config hash, so a record
+	// whose on-chain version field is altered fails verification rather than
+	// being recomputed under the wrong normalizer.
+	sig, err := p.signer.SignDigest(ctx, attest.SigningDigest(job.Version, job.ConfigHash))
 	if err != nil {
 		return err
 	}
 	fingerprint := attest.PublicKeyFingerprintBytes(p.signer.PublicKeyDER())
 
-	txHash, err := p.chain.PublishAttestation(ctx, job.DeploymentID, job.ConfigHash, sig, fingerprint)
+	txHash, err := p.chain.PublishAttestation(ctx, job.DeploymentID, uint16(job.Version), job.ConfigHash, sig, fingerprint)
 	if err != nil {
 		return err
 	}
 	p.log.Info("attestation published",
 		"deployment", job.NamespacedName,
+		"hashVersion", job.Version.String(),
 		"tx", txHash,
 	)
 	return nil

@@ -261,7 +261,8 @@ func TestSignatureVector(t *testing.T) {
 	sigPath := filepath.Join(signatureFixtureDir, "signature.der")
 	fpPath := filepath.Join(signatureFixtureDir, "fingerprint.txt")
 
-	digest := fixtureHash(t, "01-baseline")
+	// What is signed is the version-bound digest, not the bare config hash.
+	digest := attestSigningDigest(t, "01-baseline")
 
 	if *update {
 		regenerateSignatureFixture(t, digest, keyPath, pubPath, sigPath, fpPath)
@@ -294,9 +295,21 @@ func TestSignatureVector(t *testing.T) {
 	}
 
 	if !VerifyConfigHashSignature(pub, digest, sig) {
-		t.Fatal("golden signature no longer verifies over the baseline config hash; " +
-			"either the hash surface changed or the signature is no longer taken " +
-			"over the digest bytes directly")
+		t.Fatal("golden signature no longer verifies over the baseline signing digest; " +
+			"either the hash surface changed, the version binding changed, or the " +
+			"signature is no longer taken over the digest bytes directly")
+	}
+
+	// The signature must NOT verify over the bare config hash. If it did, the
+	// version binding would be decorative and a relabelled record would still
+	// verify.
+	if VerifyConfigHashSignature(pub, fixtureHash(t, "01-baseline"), sig) {
+		t.Fatal("signature verifies over the bare config hash; the version is not actually bound")
+	}
+
+	// Nor under a different protocol version.
+	if VerifyConfigHashSignature(pub, SigningDigest(V1+1, fixtureHash(t, "01-baseline")), sig) {
+		t.Fatal("signature verifies under a different protocol version")
 	}
 
 	// Negative: a single flipped bit in the digest must be rejected.
@@ -369,6 +382,69 @@ func mustWrite(t *testing.T, path string, b []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// attestSigningDigest is the digest actually signed for a fixture: the config
+// hash bound to the current protocol version.
+func attestSigningDigest(t *testing.T, name string) [32]byte {
+	t.Helper()
+	return SigningDigest(CurrentVersion, fixtureHash(t, name))
+}
+
+// TestVersionDispatch pins that an unimplemented version is a hard error rather
+// than something a caller can fall back from.
+func TestVersionDispatch(t *testing.T) {
+	dep := loadFixture(t, "01-baseline")
+
+	got, err := ConfigHashForVersion(V1, dep)
+	if err != nil {
+		t.Fatalf("v1 dispatch failed: %v", err)
+	}
+	if want := fixtureHash(t, "01-baseline"); got != want {
+		t.Error("ConfigHashForVersion(V1) disagrees with the v1 golden hash")
+	}
+
+	for _, v := range []Version{VersionUnknown, 2, 65535} {
+		if _, err := ConfigHashForVersion(v, dep); err == nil {
+			t.Errorf("ConfigHashForVersion(%d) succeeded; unknown versions must be refused", v)
+		} else if _, ok := err.(ErrUnknownVersion); !ok {
+			t.Errorf("ConfigHashForVersion(%d) returned %T, want ErrUnknownVersion", v, err)
+		}
+		if Version(v).Supported() {
+			t.Errorf("version %d reports as supported", v)
+		}
+	}
+
+	if !V1.Supported() {
+		t.Error("V1 reports as unsupported")
+	}
+	if !V1.IsWeakSurface() {
+		t.Error("V1 must be flagged as a weak surface so output can say so")
+	}
+	if VersionUnknown.String() != "unknown" || V1.String() != "v1" {
+		t.Errorf("version rendering changed: %q, %q", VersionUnknown, V1)
+	}
+}
+
+// TestSigningDigestBinding pins that the signed bytes are domain-separated and
+// version-bound, so a signature cannot be replayed across versions or confused
+// with some other use of the same key.
+func TestSigningDigestBinding(t *testing.T) {
+	h := fixtureHash(t, "01-baseline")
+	other := fixtureHash(t, "02-minimal-defaults")
+
+	if SigningDigest(V1, h) == h {
+		t.Error("signing digest equals the raw config hash; there is no binding")
+	}
+	if SigningDigest(V1, h) == SigningDigest(V1+1, h) {
+		t.Error("same digest across protocol versions; the version is not bound")
+	}
+	if SigningDigest(V1, h) == SigningDigest(V1, other) {
+		t.Error("same digest for different config hashes")
+	}
+	if SigningDigest(V1, h) != SigningDigest(V1, h) {
+		t.Error("signing digest is not deterministic")
 	}
 }
 
