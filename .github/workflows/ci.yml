@@ -51,8 +51,19 @@ jobs:
           node-version: '20'
           cache: npm
           cache-dependency-path: contracts/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: hardhat test
         working-directory: contracts
         run: |
           npm ci
           npm test
+
+      # Runs here rather than in the Go job because it needs the compiled
+      # artifact, which only exists once Hardhat has run. The Go job skips this
+      # test for that reason, so this is the step that actually enforces it.
+      - name: Go ABI matches the compiled contract
+        run: go test ./internal/chain -run TestABIMatchesCompiledArtifact -v
