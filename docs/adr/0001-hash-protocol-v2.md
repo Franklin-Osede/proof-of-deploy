@@ -186,6 +186,15 @@ The exact byte encoding must be **unambiguous** — length-prefixed or otherwise
 non-concatenative, so no two distinct field tuples can produce the same
 preimage — and covered by golden vectors before any of it is written.
 
+Implemented as: a 4-byte big-endian length before every variable-length field,
+a distinct NUL-terminated domain string per digest kind, and the fixed-width
+config hash last. `EnvelopeV2.SigningPreimage` is exported so golden vectors pin
+the bytes themselves rather than only their digest — a change that happened to
+collide would otherwise be invisible. The incarnation is `SHA-256` over the UID
+rather than the raw UID, because the Kubernetes API types a UID as an opaque
+string and a fixed-width on-chain field must not depend on it being a UUID; the
+all-zero value is reserved for "no incarnation bound".
+
 ## Decision 4 — Images
 
 **Hash the declared reference. Do not resolve tags in the operator.**
@@ -289,10 +298,14 @@ Consequences, to be stated plainly:
 
 Deliberately **not** starting with the normalizer.
 
-1. Define the exact v2 structures: `WorkloadIdentityV2`, the envelope, and the
-   byte encoding of each.
-2. Golden vectors for identity encoding, UID handling and the signed digest —
-   **before** any of it is implemented.
+1. ~~Define the exact v2 structures: `WorkloadIdentityV2`, the envelope, and the
+   byte encoding of each.~~ Done — `internal/attest/identity.go`,
+   `internal/attest/envelope.go`.
+2. ~~Golden vectors for identity encoding, UID handling and the signed digest.~~
+   Done — `internal/attest/testdata/_envelope_v2`, plus injectivity,
+   field-binding and domain-separation tests. Verified non-vacuous: replacing
+   length prefixing with either naive concatenation fails the injectivity test
+   on the exact cases it was written for.
 3. Contract v2 and its tests, against those vectors.
 4. `NormalizeV2` and its own golden set, with the benign/tampered pair moved
    across and its assertion **inverted**: equal under v1, unequal under v2.
