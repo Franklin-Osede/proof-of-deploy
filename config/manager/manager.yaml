@@ -32,7 +32,11 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: manager
-          image: controller:latest
+          image: controller:latest # replaced by config/manager/kustomization.yaml
+          # Explicit because the default depends on the tag: `latest` implies
+          # Always, anything else implies IfNotPresent. Stating it means the
+          # behaviour does not change when the tag does.
+          imagePullPolicy: IfNotPresent
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081

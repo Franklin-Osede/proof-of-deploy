@@ -5,4 +5,12 @@ resources:
 images:
   - name: controller
     newName: proof-of-deploy
-    newTag: latest
+    # Never `latest`. A mutable tag also defaults imagePullPolicy to Always,
+    # so what actually ran cannot be established after the fact -- which is a
+    # poor look for an attestation project. Must match IMAGE_TAG in the
+    # Makefile; move both together at release time.
+    #
+    # For a published release, prefer a digest over a tag:
+    #   newName: ghcr.io/<owner>/proof-of-deploy
+    #   digest: sha256:<...>
+    newTag: v0.1.0-experimental
