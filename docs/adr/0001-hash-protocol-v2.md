@@ -306,7 +306,11 @@ Deliberately **not** starting with the normalizer.
    field-binding and domain-separation tests. Verified non-vacuous: replacing
    length prefixing with either naive concatenation fails the injectivity test
    on the exact cases it was written for.
-3. Contract v2 and its tests, against those vectors.
+3. ~~Contract v2 and its tests, against those vectors.~~ Done —
+   `contracts/contracts/AttestationRegistryV2.sol`. The Hardhat tests read the
+   Go golden vectors from `internal/attest/testdata/_envelope_v2/reference.txt`
+   rather than inventing their own, so a disagreement about widths or encoding
+   between the two sides fails a test instead of surfacing on a real chain.
 4. `NormalizeV2` and its own golden set, with the benign/tampered pair moved
    across and its assertion **inverted**: equal under v1, unequal under v2.
 5. Operator and CLI.
