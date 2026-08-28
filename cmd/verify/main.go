@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/franklin1014/proof-of-deploy/internal/attest"
+	"github.com/franklin1014/proof-of-deploy/internal/buildinfo"
 	"github.com/franklin1014/proof-of-deploy/internal/chain"
 	"github.com/franklin1014/proof-of-deploy/internal/signer"
 )
@@ -60,6 +61,10 @@ func main() {
 		Short:         "Independently verify a live Deployment against its on-chain attestation",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// Setting Version makes cobra provide --version. A verifier that
+		// disagrees with the operator reports a FAIL indistinguishable from
+		// tampering, so "which build produced this answer" has to be askable.
+		Version: buildinfo.String(),
 	}
 
 	verifyCmd := &cobra.Command{

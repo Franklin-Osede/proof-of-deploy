@@ -31,6 +31,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/franklin1014/proof-of-deploy/internal/attest"
+	"github.com/franklin1014/proof-of-deploy/internal/buildinfo"
 	"github.com/franklin1014/proof-of-deploy/internal/chain"
 	"github.com/franklin1014/proof-of-deploy/internal/controller"
 	"github.com/franklin1014/proof-of-deploy/internal/publisher"
@@ -71,8 +72,14 @@ func main() {
 		"EVM chain id. Default 84532 (Base Sepolia). Polygon Amoy is 80002.")
 
 	opts := zap.Options{Development: true}
+	showVersion := flag.Bool("version", false, "Print the build version and exit.")
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if *showVersion {
+		buildinfo.Print("manager")
+		return
+	}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	if kmsKeyID == "" || ethRPCURL == "" || contractAddr == "" {

@@ -2,7 +2,26 @@
 # Trimmed from the standard kubebuilder v4 scaffold. There is no CRD in the MVP,
 # so manifests/CRD targets are intentionally omitted.
 
-IMG ?= proof-of-deploy:latest
+# VERSION identifies the build. `git describe` gives a real tag once one exists
+# and a commit-ish before that; -dirty is deliberate, so a stamped binary can
+# never claim to be a clean release when it is not.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT  ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null)
+# Overridable so a release build can pass SOURCE_DATE_EPOCH and stay reproducible.
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# IMAGE_TAG is the tag the deployment manifests reference. It must match
+# newTag in config/manager/kustomization.yaml, so `make docker-build && make
+# deploy` installs the image that was just built rather than whatever `latest`
+# happens to be.
+IMAGE_TAG ?= v0.1.0-experimental
+IMG ?= proof-of-deploy:$(IMAGE_TAG)
+
+MODULE  := github.com/franklin1014/proof-of-deploy
+LDFLAGS := -s -w \
+  -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
+  -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
+  -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
 # Tool versions
 ENVTEST_K8S_VERSION = 1.30.0
@@ -54,8 +73,8 @@ contracts-test: ## Run the Hardhat contract tests.
 ##@ Build
 .PHONY: build
 build: vet ## Build manager and verify CLI binaries.
-	go build -o bin/manager ./cmd
-	go build -o bin/pod-verify ./cmd/verify
+	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/manager ./cmd
+	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/pod-verify ./cmd/verify
 
 .PHONY: run
 run: vet ## Run the operator against the cluster in ~/.kube/config.
@@ -63,7 +82,11 @@ run: vet ## Run the operator against the cluster in ~/.kube/config.
 
 .PHONY: docker-build
 docker-build: ## Build the operator container image.
-	docker build -t ${IMG} .
+	docker build \
+	  --build-arg VERSION=$(VERSION) \
+	  --build-arg COMMIT=$(COMMIT) \
+	  --build-arg DATE=$(DATE) \
+	  -t ${IMG} .
 
 ##@ Deployment
 .PHONY: deploy
