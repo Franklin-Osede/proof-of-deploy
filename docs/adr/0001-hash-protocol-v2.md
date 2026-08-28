@@ -1,13 +1,8 @@
-# ADR 0001 — Versioning the hash protocol and defining v2
+# ADR 0001 — Protocol v2: signed envelope, identity, and hash surface
 
-**Status:** Decision 0 implemented. Decisions 1–4 proposed.
+**Status:** accepted. Decision 0 is implemented; Decisions 1–8 are accepted and
+not yet implemented.
 **Supersedes:** nothing. v1 is the format frozen in `internal/attest/testdata`.
-
-> Decision 0 (version representation) is implemented: the contract stores
-> `hashVersion`, the signed digest binds it, and the verifier refuses versions
-> it does not implement. The v1 hash surface is unchanged — Decisions 1–4 are
-> still open, and the surface list in Decision 1 is the part most worth
-> arguing with before any of it is written.
 
 ## Context
 
@@ -18,177 +13,298 @@ its name, image string, env var **names**, and resource requests/limits.
 `config/samples/demo-deployment-tampered.yaml` is byte-identical to the benign
 sample in every one of those fields, and materially more dangerous in every
 field v1 omits. Both hash to
-`89ab57526b689c52761431af4bc5451933c1947b74e0db262438ad1881c17a77`, and both
-verify as `PASS`. This was demonstrated on a live cluster and is pinned as a
-regression test.
+`89ab57526b689c52761431af4bc5451933c1947b74e0db262438ad1881c17a77` and both
+verify as `PASS`. This was demonstrated on a live cluster and is pinned by
+`TestV1WeaknessIsPinned`.
 
-So a `PASS` today means roughly *"the same named containers, from the same image
+So a v1 `PASS` means roughly *"the same named containers, from the same image
 tags, with the same env var names and resource envelope"*. It is not evidence
-about what the workload does or what it is permitted to do. For a project named
-"proof of deploy", that gap is the main credibility problem.
+about what the workload does or what it is permitted to do.
 
-Two determinism defects found while freezing v1 have already been fixed
-(quantities now canonicalize by value, selector requirements sort fully). Those
-were corrections, not surface changes. This ADR is about surface, identity and
-versioning.
+v1 also has no notion of **which cluster** it is talking about, and no notion of
+**which incarnation** of an object was observed. Both turn out to be as
+load-bearing as the hash surface itself.
 
-## Decision 0 — Where the version lives
+## Decision 0 — Where the version lives *(implemented)*
 
-**This is the decision that gates every other one, and it is not free.**
+A verifier recomputes the hash from the live Deployment, so it must know which
+normalizer to run *before* it can produce any bytes to compare. A version
+carried only inside the hashed payload is unreachable at that moment, and
+inferring it from the payload's shape misverifies as soon as two versions become
+shape-compatible.
 
-A verifier recomputes the hash from the live Deployment. To do that it must
-first know *which normalizer to run*. Therefore:
+The version is therefore stored on-chain, bound into the signed digest, and
+unknown versions are a hard error — never a fallback, because trying each
+version in turn is a downgrade oracle for anyone able to write on-chain.
 
-- The version **cannot** live only inside the hashed JSON. Reading it would
-  require producing the JSON, which requires already knowing the version.
-- The version **must not** be inferred from the shape of the JSON. Shape
-  sniffing turns a protocol into a guessing game and silently misverifies the
-  moment two versions become shape-compatible.
+Implemented in `internal/attest/version.go`, `AttestationRegistry.sol` and
+`cmd/verify`. **Decision 3 below extends the signed digest and supersedes the
+current `SigningDigest` shape.**
 
-That leaves the version as data the verifier obtains *alongside* the
-attestation, which means on-chain.
+## Decision 1 — What v2 hashes
 
-### Options
+### The question v2 answers
 
-**A. Add a `uint16 hashVersion` field to the `Attestation` struct.**
-Explicit, one storage slot, trivially readable, and impossible to misinterpret.
-Requires deploying a new contract — but the current one has an **immutable**
-`publisher` and no upgrade path, so any change at all already means a new
-deployment and a new address to distribute.
+> *Does this workload execute, and is it permitted to do, what was attested?*
 
-**B. Encode the version in the `deploymentId` key.**
-Avoids a struct change but conflates identity with format, and silently
-partitions history: the same Deployment would occupy two unrelated slots.
-Rejected.
+Not *"is this Deployment identical in every declared field"*. The narrower claim
+is more defensible, more stable, and lets rollout-shaped fields be excluded for
+a stated reason rather than by omission.
 
-**C. Keep it off-chain, supplied to the verifier by configuration.**
-No contract change, but the verifier's most security-relevant input becomes a
-flag a human sets. A wrong `--hash-version` produces a confident wrong answer.
-Rejected.
+### The inclusion rule
 
-**D. Prefix the signed payload with a version byte, sign `version || configHash`.**
-Binds the version cryptographically, which A alone does not. But the verifier
-still needs the version *before* recomputing, so this is a complement to A, not
-a substitute.
+A list is an accident; a rule is a decision. Fields are included when they are
+**declarative fields that change the Pod's runtime, credentials, isolation,
+resource access, or placement eligibility.**
 
-### Proposed
+Every future field is argued against that rule, not against this list.
 
-**A, combined with D.** Store `hashVersion` explicitly on-chain so the verifier
-can read it before recomputing, and include it in the signed bytes so a
-tampered version field is detectable rather than merely wrong.
+### Included
 
-The verifier **must reject unknown versions outright**. It must never try v1,
-then v2, then report whichever matched: that converts an unknown format into a
-downgrade oracle and would let an attacker who can write on-chain steer a
-verifier onto the weaker surface.
+For **both** `containers` and `initContainers`: `name`, `image`, `command`,
+`args`, `workingDir`, `ports`, `imagePullPolicy`, `resources`, env var **names**
+plus their `valueFrom` references, `envFrom` references, `volumeMounts`,
+`securityContext`, probes and lifecycle hooks.
 
-**Consequence to accept up front:** this requires a new contract deployment and
-a new address distributed to every consumer. Given the immutable publisher, that
-cost is already unavoidable for any change and should not be spent twice —
-batching, append-only history and any other storage change worth making should
-be decided before the redeploy, not after.
+At pod level: `securityContext`, `volumes`, `serviceAccountName`,
+`automountServiceAccountToken`, `hostNetwork`, `hostPID`, `hostIPC`,
+`runtimeClassName`, `nodeSelector`, `affinity`, `tolerations`.
 
-## Decision 1 — The v2 surface
+Pod template labels stay in: NetworkPolicies select by pod label, so a label
+change can change which policy applies.
 
-v2 hashes the executable and privilege-relevant shape of the pod, for **both**
-`containers` and `initContainers`:
+**To be evaluated against the rule before implementation**, not silently
+dropped: `schedulerName`, `nodeName`, `topologySpreadConstraints`,
+`priorityClassName`, `preemptionPolicy`, `hostAliases`, `dnsPolicy`,
+`dnsConfig`.
 
-| Included | Why |
+### Excluded, with reasons
+
+- **`replicas`.** Reversing v1. Scaling does not change a Pod's code,
+  credentials, filesystem, namespaces or privileges, and an HPA rewrites it
+  continuously — every stabilization would mean a fresh hash, a KMS call and a
+  transaction. Once out, a post-scaling reconcile recomputes the same hash and
+  dedup suppresses the publish.
+- **`strategy`, `paused`, `minReadySeconds`, `progressDeadlineSeconds`.** They
+  change how a workload is *delivered*, not what a converged instance can do.
+- **All annotations, all `status`,** and **env var values** — the last so a
+  Secret can never enter the hash, the logs, or a public chain. Recording that a
+  variable comes *from* a given Secret is in scope; its contents are not.
+
+### What v2 explicitly does not claim
+
+v2 attests **execution and privilege**, not capacity, cost, availability or
+scale. Going from 3 to 5 replicas can amplify a malicious workload and does
+affect cost; that belongs to a different claim — a rollout/capacity attestation —
+and must not contaminate `ConfigHashV2`.
+
+Scheduling fields are included because placement is a real security boundary for
+organisations that use it as one. They are the most likely source of noisy
+`FAIL`s, and unlike `replicas` they are not rewritten automatically.
+
+## Decision 2 — Identity and incarnation
+
+Three distinct things, currently conflated into `SHA-256("namespace/name")`:
+
+```
+cluster identity  = which cluster this was observed in
+logical identity  = clusterID + apiVersion + kind + namespace + name
+incarnation       = the Kubernetes UID of the specific object observed
+```
+
+### clusterID is mandatory
+
+Without it, `payments/api` in cluster A and `payments/api` in cluster B occupy
+the same on-chain slot and overwrite each other. `pod-verify` printing the
+kubeconfig context does not fix this: that string is local, mutable and bound to
+nothing.
+
+clusterID must be **explicitly configured**, stable for the cluster's lifetime,
+part of the on-chain key, part of the signed envelope, and displayed by
+`pod-verify`. It must **not** be derived from the kubeconfig context name. A
+managed string/`bytes32` is adequate for the demo; how it is distributed and why
+a verifier should trust it must be documented.
+
+### Encoding
+
+`WorkloadIdentityV2 { clusterID, apiVersion, kind, namespace, name }`, with an
+**unambiguous** encoding — not informal `/` concatenation.
+`TestDeploymentIDFormat` already pins that v1's construction is not injective on
+arbitrary strings and is safe only because Kubernetes names cannot contain `/`.
+v2 must not inherit that.
+
+### UID stays out of the config hash — and must be signed
+
+UID describes *which instance*, not *what was configured*. Inside `ConfigHash`
+it would make an identical redeploy hash differently, and would make manifests
+unverifiable from Git where no UID exists.
+
+But **storing it on-chain without signing it is worth nothing.** A compromised
+publisher EOA could pair a valid KMS signature with a different UID, which
+defeats the entire separation between the EOA that writes and the KMS key that
+attests. UID goes in the signed envelope.
+
+### Verifier output
+
+| Source | UID | Result |
+|---|---|---|
+| live cluster | matches | `PASS` |
+| live cluster | differs | `FAIL` — a different incarnation |
+| Git manifest | absent | **not** a full `PASS` |
+
+A manifest check must not print the same `PASS` as a live check. Something like:
+
+```
+CONFIG MATCH  payments/api
+  incarnation: NOT VERIFIED (manifest has no Kubernetes UID)
+```
+
+or an explicit `--manifest` mode with its own contract. Omitting the UID is
+legitimate; it just yields a weaker guarantee, and the output has to say so.
+
+## Decision 3 — The signed envelope
+
+Conceptually:
+
+```
+signedDigest = SHA-256(
+    "proof-of-deploy"     ||   // domain separation
+    protocolVersion       ||
+    clusterID             ||
+    apiVersion || kind    ||
+    namespace  || name    ||
+    uid                   ||   // incarnation
+    configHash                 // Decision 1's surface
+)
+```
+
+Everything a verifier must not be able to swap independently of the signature is
+bound here. The current implementation binds only domain, version and config
+hash; it is insufficient for v2 and will be replaced.
+
+The exact byte encoding must be **unambiguous** — length-prefixed or otherwise
+non-concatenative, so no two distinct field tuples can produce the same
+preimage — and covered by golden vectors before any of it is written.
+
+## Decision 4 — Images
+
+**Hash the declared reference. Do not resolve tags in the operator.**
+
+Hashing what was declared preserves a reproducible claim: *"the Deployment
+declared exactly this reference."* Resolving would fold in a second, different
+claim: *"this registry returned this digest at this instant"* — making the
+registry and the moment of resolution new roots of trust, and attesting
+something the operator learned from a third party in a moment nobody can
+reproduce.
+
+The verifier classifies the reference by **structured parsing**, not string
+matching:
+
+| Form | Meaning |
 |---|---|
-| `image` | already in v1 |
-| `command`, `args` | a different program from the same image |
-| `env` names **and** their **source** (`valueFrom` ref), plus `envFrom` refs | which Secret/ConfigMap feeds the process |
-| `volumeMounts` and the `volumes` they resolve to | `hostPath`, Secret and ConfigMap exposure |
-| `securityContext` (pod and container) | `privileged`, capabilities, `runAsUser`, `allowPrivilegeEscalation` |
-| `ports`, `workingDir`, `imagePullPolicy` | observable execution surface |
-| probes and lifecycle hooks | arbitrary execution paths |
-| `resources` | already in v1 |
-| `serviceAccountName`, `automountServiceAccountToken` | cluster identity granted to the workload |
-| `hostNetwork`, `hostPID`, `hostIPC` | host namespace escape surface |
-| `nodeSelector`, `affinity`, `tolerations`, `runtimeClassName` | where and under what runtime it lands |
+| `repo/app@sha256:…` | declaratively pinned |
+| `repo/app:v1.2.3` | mutable tag |
+| `repo/app` or `repo/app:latest` | mutable and especially ambiguous |
 
-Still excluded, deliberately: all annotations, all `status`, and env var
-**values** — the last so a Secret can never enter the hash, the logs, or a
-public chain. Recording that a variable *comes from* a given Secret is in
-scope; recording what that Secret contains is not.
+and warns on the mutable cases, the same way a v1 `PASS` warns about its
+surface.
 
-**Open question, not decided here:** whether `strategy`, `paused`,
-`minReadySeconds` and `progressDeadlineSeconds` belong in v2. They change
-rollout behaviour but not the running workload's privileges.
+**Even a digest does not license "these exact bytes ran."** The digest may
+address a multi-architecture manifest list, from which the runtime selects a
+platform-specific image. Far better than a tag; still not runtime attestation.
 
-## Decision 2 — Logical identity vs incarnation
+## Decision 5 — v1/v2 compatibility
 
-**UID stays out of `ConfigHash`.** A UID describes *which instance* of an object
-this is, not *what was configured*. Two reasons:
+- The operator publishes **v2 only**. No dual publication.
+- Unknown versions remain a hard error.
+- A v1 `PASS` requires an explicit `--allow-v1`. A warning was right while v1
+  was the only option; once there is an alternative, accepting the weak surface
+  must be a deliberate act.
+- v1 output keeps saying its surface is weak.
 
-1. It is not configuration. Mixing it in would mean an identical redeploy
-   produces a different hash, which destroys the property that the hash
-   describes declared intent.
-2. It would make manifests unverifiable from Git, where no UID exists. Being
-   able to compare a repository's declared intent against the chain is worth
-   keeping reachable.
+**Correction of terminology:** v1 is not supported for "reading history". The
+contract is latest-only, so what survives is the `latest` slot of a known v1
+contract plus its events — and those events do not carry the signature. v1 is
+supported for verifying **records still readable in known v1 contracts**, which
+is a much narrower statement.
 
-But incarnation still matters. `DeploymentID` is `SHA-256("namespace/name")`
-with no incarnation, so between a delete/recreate and the new transaction being
-mined, `pod-verify` matches a fresh object against its predecessor's record and
-returns `PASS`. The in-memory dedup fix narrowed that window; it did not close
-it.
+## Decision 6 — Storage and events
 
-**Proposed:** model incarnation as identity metadata *outside* the config hash —
-a separate field recorded with the attestation. This keeps the hash purely about
-configuration while letting a verifier detect that it is looking at a different
-instance than the one attested. The exact shape (UID, `creationTimestamp`, a
-monotonic counter) is deferred; note that a Git-manifest verifier would simply
-have no value to compare, which is correct rather than a failure.
+Keep **latest-only storage**, and make the **event self-sufficient**: workload
+identity (including clusterID), UID/incarnation, hash version, config hash,
+signer fingerprint, **signature**, and timestamp.
 
-`DeploymentID`'s other weakness is recorded in `TestDeploymentIDFormat`: it is
-not injective on arbitrary strings, and is safe only because Kubernetes names
-cannot contain `/`. Any richer v2 identity must use an unambiguous encoding
-rather than inherit that.
+Log data is cheaper than storage, and carrying the signature is what makes a
+historical attestation reconstructible at all — the current event omits it, so
+superseded v1 records are unrecoverable. A test must assert the event and the
+stored record carry exactly the same values.
 
-## Decision 3 — Images
+Limits this does **not** overcome, and which the README must state:
 
-**Hash the declared image string. Do not resolve tags in the operator.**
+- contracts cannot read logs, so this is for off-chain verifiers only;
+- a historical verifier needs an RPC with unpruned logs, or an indexer;
+- reorg and finality still apply;
+- *reconstructible* is not *guaranteed available*.
 
-Resolving a tag to a digest would make the attestation stronger, but it makes
-the **registry** and the **instant of resolution** into new roots of trust: the
-operator would be attesting something it learned from a third party at a moment
-nobody can reproduce. That is a larger change to the trust model than it looks,
-and it belongs in its own ADR if wanted.
+## Decision 7 — Batching: deferred
 
-Instead: v2 keeps hashing the declared value, and the project **recommends**
-pinning by digest (`image: repo/app@sha256:...`). The sample workload already
-does. A future option is to record the declared string and any separately
-resolved digest as **distinct** fields, so a reader can see which is which.
+Not built now. First ship the cheap fixes that reduce the volume:
 
-**Consequence to state plainly in the README:** with a floating tag, the bytes
-behind `repo/app:latest` can change with no hash change and no `FAIL`. v2 does
-not fix this; pinning by digest does.
+- opt-in annotation (`proof-of-deploy.dev/attest: "true"`);
+- namespace allowlist/selector;
+- exclusion of the operator's own namespace by default;
+- volume and cost metrics.
 
-## Decision 4 — v1/v2 compatibility
+Then **measure** before designing anything: selected Deployments, rollouts/day,
+publications/day, gas per publication, peak backlog, monthly testnet cost.
+Merkle batching must be justified by observed volume, not by a hypothesis about
+thousands of Deployments.
 
-- **Verification:** v1 stays supported for reading historical records only, and
-  is labelled in output as a weak surface. A `PASS` against a v1 attestation
-  should say so.
-- **Publication:** once v2 exists, the operator publishes v2 only. No dual
-  publication — it doubles gas and creates two answers to one question.
-- **Unknown versions are a hard error.** Never a fallback, never a heuristic.
-- **Golden vectors:** the v1 set stays exactly as it is. v2 gets its own set,
-  and the benign/tampered pair moves into it with the assertion **inverted**:
-  the two must hash *differently* under v2. `TestV1WeaknessIsPinned` is written
-  to fail the moment the surface widens, which is the intended trigger for that
-  move.
+## Decision 8 — Publisher stays immutable
+
+A rotatable `owner` would add exactly the administrative power this design
+avoids, and would cost the property that the contract is small enough to audit
+at a glance.
+
+Consequences, to be stated plainly:
+
+- loss or compromise means a **new contract**;
+- a new address, and probably a new code hash, must be redistributed;
+- consumers depend on a versioned distribution of that address;
+- never mainnet, never real funds.
 
 ## Consequences
 
-- A new contract deployment and a new address for every consumer.
-- Every v1 attestation becomes historical; nothing migrates.
+- A new contract deployment and a new address for every consumer. The publisher
+  is immutable, so this was already unavoidable — the point is to settle the v2
+  record layout (version, cluster identity, UID, self-sufficient event) *before*
+  it, so the cost is paid once. Batching can wait: it would likely arrive as a
+  separate entry point, and probably a separate contract, either way.
+- Every v1 attestation becomes historical. Nothing migrates.
 - `internal/attest` grows substantially, and so does its blast radius. The
-  golden set is what makes that tractable.
-- The demo gains its real ending: the tampered workload finally produces `FAIL`.
+  golden set is what keeps that tractable.
+- The demo gains its real ending: the tampered workload finally `FAIL`s.
 
-## Not decided here
+## Implementation order
 
-Append-only history vs latest-only, batching, publisher key rotation, and
-whether to attest kinds other than Deployment. All of these interact with the
-redeploy forced by Decision 0 and should be settled before it, not after.
+Deliberately **not** starting with the normalizer.
+
+1. Define the exact v2 structures: `WorkloadIdentityV2`, the envelope, and the
+   byte encoding of each.
+2. Golden vectors for identity encoding, UID handling and the signed digest —
+   **before** any of it is implemented.
+3. Contract v2 and its tests, against those vectors.
+4. `NormalizeV2` and its own golden set, with the benign/tampered pair moved
+   across and its assertion **inverted**: equal under v1, unequal under v2.
+5. Operator and CLI.
+
+Writing the normalizer first risks discovering late that the contract, KMS and
+CLI each signed a different notion of identity.
+
+## Still open
+
+The two v1 determinism defects (`matchExpressions` values tiebreak, quantity
+canonicalization) are already fixed. The `Selector.MatchLabels` filtering
+asymmetry — pod template labels are filtered through the generated-label
+denylist, selector match labels are not — is unresolved and should be settled as
+part of defining the v2 surface.

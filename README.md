@@ -234,8 +234,10 @@ See `docs/adr/0001-hash-protocol-v2.md` for the proposed v2.
 input Deployment, the exact canonical JSON bytes, the config hash and the
 deployment ID. Each fixture is self-checking — the test asserts that the stored
 hash really is SHA-256 of the stored JSON — and a fixed test key plus a
-precomputed signature pins the rule that the signature is taken over the config
-hash bytes directly, with no second hashing.
+precomputed signature pins the signing rule: the signature is taken over the
+version-bound digest (`SHA-256(domain || version || configHash)`) and over
+nothing else. Tests assert it verifies over neither the bare config hash nor a
+different protocol version.
 
 A diff in any golden file is a protocol change. Regenerate deliberately:
 
@@ -274,9 +276,10 @@ Determinism currently rests on struct declaration order, `encoding/json`'s
 documented sorting of map keys, explicit sorting of every slice in
 `normalize.go`, and `resource.Quantity.String()`. That last one is the least
 guarded — its canonical form is decided by an upstream Kubernetes library, not by
-this repository. **Golden vectors executed on every supported Go version are the
-real defense here**; the toolchain pin in `go.mod` is a precaution, not a
-guarantee. Neither exists yet.
+this repository. **Golden vectors are the real defense here**; the toolchain pin
+in `go.mod` is a precaution, not a guarantee. Both now exist — see
+[Golden vectors](#golden-vectors) — though the vectors run only on the pinned Go
+version, not across every version the project claims to support.
 
 ---
 
@@ -337,7 +340,11 @@ Honest inventory of what is missing, roughly in priority order.
 
 **Protocol**
 - The hash surface is too narrow to support a strong "proof of deploy" claim.
-- No hash version, and no golden vectors pinning the canonical encoding.
+- **There is no cluster identity.** `DeploymentID` is
+  `SHA-256("namespace/name")`, so `payments/api` in two different clusters
+  occupies the same on-chain slot and each overwrites the other. `pod-verify`
+  prints the cluster it read, but that string is local and is bound to nothing
+  in the record.
 - `DeploymentID` carries no incarnation, so a recreated Deployment can match its
   predecessor's record.
 - `image` is a tag string, not a resolved digest.
@@ -360,14 +367,18 @@ Honest inventory of what is missing, roughly in priority order.
 - Hardhat falls back to a live public RPC when `RPC_URL` is unset.
 
 **Testing and tooling**
-- No tests for the publisher, signer, chain client, or CLI.
-- No `contracts/package-lock.json`, so CI cannot use `npm ci`.
+- No tests for the publisher, the KMS signer, or the verify CLI. The chain
+  client is covered only by the ABI drift check, not by encode/decode tests.
 - The local end-to-end path is documented and has been executed (see
   `docs/local-demo.md`), but nothing runs it automatically: there is no e2e job
   in CI, so it can rot silently.
 
-**Before this is more than a demo**, at minimum: a versioned protocol, a
-defensible hash surface, delivery reconciled through receipt and finality,
-documented key rotation, an automatically verified ABI, unit and end-to-end
-tests, observability that notices a dead attestor, explicit workload selection,
-and a published threat model. None of those is complete today.
+**Before this is more than a demo**, at minimum: a defensible hash surface,
+cluster-aware identity, delivery reconciled through receipt and finality,
+documented key rotation, unit and end-to-end tests, observability that notices a
+dead attestor, explicit workload selection, and a published threat model. The
+protocol is versioned and the ABI is automatically verified; the rest is not
+done.
+
+`docs/adr/0001-hash-protocol-v2.md` records the accepted design for closing the
+protocol gaps.
