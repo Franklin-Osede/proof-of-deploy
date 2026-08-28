@@ -222,9 +222,19 @@ normalizer.
 turn: falling back would let anyone able to write on-chain steer a verifier onto
 a weaker hash surface by relabelling a record.
 
-| Version | Surface |
-|---|---|
-| `v1` | current. Narrow — see [What fields are excluded and why](#what-fields-are-excluded-and-why). Every `v1` PASS prints a warning saying so. |
+| Version | Surface | Status |
+|---|---|---|
+| `v1` | Narrow — see [What fields are excluded and why](#what-fields-are-excluded-and-why). Every `v1` PASS prints a warning saying so. | what the operator publishes today |
+| `v2` | Execution and privilege: containers **and init containers**, command/args, env sources, volumes and mounts, security contexts, service account, image pull secrets, host namespaces, runtime class and placement. | implemented and verifiable; not yet published |
+
+v2 answers *"does this workload execute, and is it permitted to do, what was
+attested?"* — not *"is this Deployment identical in every declared field"*. It
+deliberately does **not** attest capacity, cost, availability or scale;
+`replicas` is excluded, because scaling changes no Pod's privileges while an HPA
+would churn it on every stabilization.
+
+The benign and tampered demo workloads hash identically under v1 and
+**differently under v2**, which is the whole point of the change.
 
 See `docs/adr/0001-hash-protocol-v2.md` for the proposed v2.
 
@@ -339,7 +349,9 @@ out of band.
 Honest inventory of what is missing, roughly in priority order.
 
 **Protocol**
-- The hash surface is too narrow to support a strong "proof of deploy" claim.
+- The operator still publishes `v1`, whose surface is too narrow to support a
+  strong "proof of deploy" claim. `v2` exists and verifies, but the operator and
+  chain client are not yet wired to the v2 contract.
 - **There is no cluster identity.** `DeploymentID` is
   `SHA-256("namespace/name")`, so `payments/api` in two different clusters
   occupies the same on-chain slot and each overwrites the other. `pod-verify`

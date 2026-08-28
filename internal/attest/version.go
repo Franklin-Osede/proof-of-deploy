@@ -49,7 +49,18 @@ const (
 	// benign/tampered fixture pair that pins the property.
 	V1 Version = 1
 
+	// V2 hashes the executable and privilege-relevant shape of the pod, for
+	// both containers and initContainers: image, command, args, env sources,
+	// mounts, volumes, security contexts, service account, host namespaces,
+	// runtime class and placement. See NormalizeV2 and
+	// docs/adr/0001-hash-protocol-v2.md.
+	V2 Version = 2
+
 	// CurrentVersion is what the operator publishes.
+	//
+	// Still V1: NormalizeV2 exists and v2 records can be verified, but the
+	// operator and chain client are not yet wired to the v2 contract. Flipping
+	// this before that would publish v2 hashes into a v1 registry.
 	CurrentVersion = V1
 )
 
@@ -64,7 +75,7 @@ const (
 type ErrUnknownVersion struct{ Version Version }
 
 func (e ErrUnknownVersion) Error() string {
-	return fmt.Sprintf("attest: unsupported hash protocol version %d (this build implements v%d)", e.Version, V1)
+	return fmt.Sprintf("attest: unsupported hash protocol version %d (this build implements v%d and v%d)", e.Version, V1, V2)
 }
 
 // String renders a version for logs and CLI output.
@@ -76,12 +87,15 @@ func (v Version) String() string {
 }
 
 // Supported reports whether this build implements the version.
-func (v Version) Supported() bool { return v == V1 }
+func (v Version) Supported() bool { return v == V1 || v == V2 }
 
 // IsWeakSurface reports whether a version's hash surface is known to miss
 // security-relevant fields, so output can say so rather than let a bare PASS
 // imply more than it means.
 func (v Version) IsWeakSurface() bool { return v == V1 }
+
+// v1 is the only weak surface; v2 covers execution and privilege. See
+// NormalizedDeploymentV2 for what v2 still does not claim.
 
 // ConfigHashForVersion normalizes and hashes a Deployment under a specific
 // protocol version. This is the single dispatch point: adding v2 adds a branch
@@ -91,6 +105,8 @@ func ConfigHashForVersion(v Version, d *appsv1.Deployment) ([32]byte, error) {
 	switch v {
 	case V1:
 		return ConfigHash(Normalize(d))
+	case V2:
+		return ConfigHashV2(NormalizeV2(d))
 	default:
 		return [32]byte{}, ErrUnknownVersion{Version: v}
 	}

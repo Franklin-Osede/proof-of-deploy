@@ -405,7 +405,18 @@ func TestVersionDispatch(t *testing.T) {
 		t.Error("ConfigHashForVersion(V1) disagrees with the v1 golden hash")
 	}
 
-	for _, v := range []Version{VersionUnknown, 2, 65535} {
+	gotV2, err := ConfigHashForVersion(V2, dep)
+	if err != nil {
+		t.Fatalf("v2 dispatch failed: %v", err)
+	}
+	if want := fixtureHashV2(t, "01-baseline"); gotV2 != want {
+		t.Error("ConfigHashForVersion(V2) disagrees with the v2 golden hash")
+	}
+	if gotV2 == got {
+		t.Error("v1 and v2 produced the same hash for the same Deployment; the surfaces are not distinct")
+	}
+
+	for _, v := range []Version{VersionUnknown, 3, 65535} {
 		if _, err := ConfigHashForVersion(v, dep); err == nil {
 			t.Errorf("ConfigHashForVersion(%d) succeeded; unknown versions must be refused", v)
 		} else if _, ok := err.(ErrUnknownVersion); !ok {
@@ -416,14 +427,23 @@ func TestVersionDispatch(t *testing.T) {
 		}
 	}
 
-	if !V1.Supported() {
-		t.Error("V1 reports as unsupported")
+	if !V1.Supported() || !V2.Supported() {
+		t.Error("a version this build implements reports as unsupported")
 	}
 	if !V1.IsWeakSurface() {
 		t.Error("V1 must be flagged as a weak surface so output can say so")
 	}
-	if VersionUnknown.String() != "unknown" || V1.String() != "v1" {
-		t.Errorf("version rendering changed: %q, %q", VersionUnknown, V1)
+	if V2.IsWeakSurface() {
+		t.Error("V2 is flagged as a weak surface; it covers execution and privilege")
+	}
+	if VersionUnknown.String() != "unknown" || V1.String() != "v1" || V2.String() != "v2" {
+		t.Errorf("version rendering changed: %q, %q, %q", VersionUnknown, V1, V2)
+	}
+	// The operator still publishes v1 until the chain client is wired to the
+	// v2 contract; flipping CurrentVersion before that would write v2 hashes
+	// into a v1 registry.
+	if CurrentVersion != V1 {
+		t.Log("CurrentVersion moved off v1 -- confirm the operator and chain client target the v2 contract")
 	}
 }
 

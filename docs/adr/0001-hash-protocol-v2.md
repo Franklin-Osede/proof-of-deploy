@@ -73,10 +73,28 @@ At pod level: `securityContext`, `volumes`, `serviceAccountName`,
 Pod template labels stay in: NetworkPolicies select by pod label, so a label
 change can change which policy applies.
 
-**To be evaluated against the rule before implementation**, not silently
-dropped: `schedulerName`, `nodeName`, `topologySpreadConstraints`,
-`priorityClassName`, `preemptionPolicy`, `hostAliases`, `dnsPolicy`,
-`dnsConfig`.
+**Evaluated against the rule during implementation**, all eight included:
+`schedulerName` and `nodeName` decide placement; `topologySpreadConstraints`
+likewise; `priorityClassName` and `preemptionPolicy` let a workload displace
+others; `hostAliases`, `dnsPolicy` and `dnsConfig` change name resolution and
+therefore redirect traffic.
+
+Writing the surface also produced `TestV2SurfaceAccountsForEveryField`, which
+reflects over the upstream `PodSpec` and `Container` and fails when a field is
+in neither the attested surface nor the documented exclusions. It is what makes
+an allowlist defensible: without it a field added upstream is silently absent
+from the hash and nothing fails. It immediately caught eight that had been
+missed — `imagePullSecrets`, `shareProcessNamespace`, `hostUsers`,
+`resourceClaims`, `enableServiceLinks`, `schedulingGates`, `os`, and the
+container-level `restartPolicy` that distinguishes a sidecar from a plain init
+container — all of which are now included.
+
+**Ordering.** v2 preserves declared list order everywhere. v1 sorted containers
+and env names; repeating that would be a security defect rather than a
+convenience. Init containers run in sequence, so sorting them would make two
+different execution plans hash identically, and Kubernetes expands `$(VAR)`
+using variables defined earlier in the env list. Sorting is justified only when
+order is neither semantic nor stable; here it is both.
 
 ### Excluded, with reasons
 
@@ -311,17 +329,26 @@ Deliberately **not** starting with the normalizer.
    Go golden vectors from `internal/attest/testdata/_envelope_v2/reference.txt`
    rather than inventing their own, so a disagreement about widths or encoding
    between the two sides fails a test instead of surfacing on a real chain.
-4. `NormalizeV2` and its own golden set, with the benign/tampered pair moved
-   across and its assertion **inverted**: equal under v1, unequal under v2.
+4. ~~`NormalizeV2` and its own golden set, with the benign/tampered pair moved
+   across and its assertion **inverted**.~~ Done — `internal/attest/normalize_v2.go`.
+   The pair is equal under v1 and unequal under v2, asserted by
+   `TestV2DetectsTheTamperedWorkload`.
 5. Operator and CLI.
 
 Writing the normalizer first risks discovering late that the contract, KMS and
 CLI each signed a different notion of identity.
 
+## Resolved during implementation
+
+The `Selector.MatchLabels` filtering asymmetry is **correct and kept**. Pod
+template labels are filtered through the generated-label denylist because
+controllers and tooling write there; nothing injects into a Deployment's
+selector, which is immutable in `apps/v1`. Making it symmetric would let two
+genuinely different selectors hash the same — a false PASS traded for no
+benefit. Documented in `NormalizeV2` rather than left to look like an oversight.
+
 ## Still open
 
-The two v1 determinism defects (`matchExpressions` values tiebreak, quantity
-canonicalization) are already fixed. The `Selector.MatchLabels` filtering
-asymmetry — pod template labels are filtered through the generated-label
-denylist, selector match labels are not — is unresolved and should be settled as
-part of defining the v2 surface.
+`CurrentVersion` remains v1: `NormalizeV2` exists and v2 records verify, but the
+operator and chain client are not yet wired to the v2 contract. Flipping it
+before that would publish v2 hashes into a v1 registry. That is step 5.

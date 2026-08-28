@@ -70,3 +70,10 @@ func MustHex(h [32]byte) string {
 func DeploymentID(namespace, name string) [32]byte {
 	return sha256.Sum256([]byte(namespace + "/" + name))
 }
+
+// jsonMarshal and sha256Sum exist so the v2 encoder shares exactly the same
+// primitives as v1. Two protocols disagreeing about what "SHA-256 of compact
+// JSON" means would be a very quiet bug.
+func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
+
+func sha256Sum(b []byte) [32]byte { return sha256.Sum256(b) }
