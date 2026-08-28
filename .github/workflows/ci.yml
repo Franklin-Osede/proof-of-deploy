@@ -41,6 +41,14 @@ jobs:
       - name: test
         run: make test
 
+      # The v2 golden vectors are pinned by Go tests that use the same encoder
+      # they are checking, which proves determinism but not correctness. This
+      # re-derives them with an independent implementation written from the
+      # documented layout. Cheap, and it is the only check that would catch the
+      # encoder and its vectors being wrong together.
+      - name: v2 vectors match the independent reference implementation
+        run: python3 internal/attest/testdata/_envelope_v2/reference.py --check
+
   contracts:
     name: Contracts
     runs-on: ubuntu-latest
