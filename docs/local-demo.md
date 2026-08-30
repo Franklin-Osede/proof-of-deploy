@@ -20,6 +20,12 @@ The `:4` tag is the last community image; `:latest` now requires a licence.
 docker run -d --name localstack-pod -p 4566:4566 -e SERVICES=kms \
   localstack/localstack:4
 
+# LocalStack needs ~15-30s before KMS answers. Without this wait the next
+# command fails with "Connection was closed before we received a valid
+# response".
+curl -s --retry 40 --retry-delay 3 --retry-all-errors --max-time 5 \
+  http://localhost:4566/_localstack/health >/dev/null
+
 export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
 export AWS_ENDPOINT_URL_KMS=http://localhost:4566
 
@@ -33,8 +39,19 @@ export KMS_KEY_ID=$(aws --endpoint-url=$AWS_ENDPOINT_URL_KMS kms create-key \
 ```sh
 cd contracts && npm ci
 npx hardhat node &                     # chain id 31337 on :8545
+
+# Same again: the node is not listening the instant it is backgrounded, and
+# deploying too early fails with ECONNREFUSED on 127.0.0.1:8545.
+curl -s --retry 30 --retry-delay 2 --retry-all-errors --max-time 5 \
+  -X POST -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
+  http://127.0.0.1:8545 >/dev/null
+
 npx hardhat run scripts/deploy.js --network localhost
 ```
+
+Every step from here on assumes the same shell: the exports above are carried
+forward, not re-derived.
 
 Note the printed `CONTRACT_ADDRESS`. The deployer becomes the contract's
 immutable `publisher`, so the operator must use that same account as
@@ -72,7 +89,7 @@ README "Failure modes".
 
 ```sh
 go build -o bin/pod-verify ./cmd/verify
-./bin/pod-verify verify --kubeconfig ~/.kube/config \
+./bin/pod-verify verify --context kind-proof-of-deploy \
   --namespace demo --name api \
   --eth-rpc-url http://127.0.0.1:8545 \
   --contract-address <from step 2> \
