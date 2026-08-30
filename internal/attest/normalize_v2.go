@@ -17,6 +17,9 @@ limitations under the License.
 package attest
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 )
@@ -171,7 +174,7 @@ func normalizeEnvRefs(env []corev1.EnvVar) []NormalizedEnvRef {
 // CanonicalJSONV2 returns the deterministic JSON encoding of a v2 normalized
 // Deployment. Compact, never indented: whitespace is part of the digest.
 func CanonicalJSONV2(nd NormalizedDeploymentV2) ([]byte, error) {
-	return jsonMarshal(nd)
+	return json.Marshal(nd)
 }
 
 // ConfigHashV2 is the SHA-256 over the canonical v2 JSON.
@@ -180,5 +183,5 @@ func ConfigHashV2(nd NormalizedDeploymentV2) ([32]byte, error) {
 	if err != nil {
 		return [32]byte{}, err
 	}
-	return sha256Sum(b), nil
+	return sha256.Sum256(b), nil
 }

@@ -94,9 +94,6 @@ func (v Version) Supported() bool { return v == V1 || v == V2 }
 // imply more than it means.
 func (v Version) IsWeakSurface() bool { return v == V1 }
 
-// v1 is the only weak surface; v2 covers execution and privilege. See
-// NormalizedDeploymentV2 for what v2 still does not claim.
-
 // ConfigHashForVersion normalizes and hashes a Deployment under a specific
 // protocol version. This is the single dispatch point: adding v2 adds a branch
 // here, and every caller inherits the version check rather than reimplementing

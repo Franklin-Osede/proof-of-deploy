@@ -47,16 +47,6 @@ func ConfigHash(nd NormalizedDeployment) ([32]byte, error) {
 	return sha256.Sum256(b), nil
 }
 
-// ConfigHashHex is ConfigHash rendered as a lowercase hex string, convenient
-// for logs and CLI output.
-func ConfigHashHex(nd NormalizedDeployment) (string, error) {
-	h, err := ConfigHash(nd)
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h[:]), nil
-}
-
 // MustHex renders a 32-byte hash as a lowercase hex string. Convenience for
 // logs and CLI output where an error path is not useful.
 func MustHex(h [32]byte) string {
@@ -70,10 +60,3 @@ func MustHex(h [32]byte) string {
 func DeploymentID(namespace, name string) [32]byte {
 	return sha256.Sum256([]byte(namespace + "/" + name))
 }
-
-// jsonMarshal and sha256Sum exist so the v2 encoder shares exactly the same
-// primitives as v1. Two protocols disagreeing about what "SHA-256 of compact
-// JSON" means would be a very quiet bug.
-func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
-
-func sha256Sum(b []byte) [32]byte { return sha256.Sum256(b) }

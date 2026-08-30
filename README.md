@@ -8,7 +8,9 @@ it against the on-chain record.
 
 > **Status: testnet demonstration.** Not production software. Never point it at
 > mainnet, and never fund the Ethereum account it uses with real value. See
-> [Known gaps](#known-gaps) for what is missing.
+> [Known gaps](#known-gaps) for what is missing, [CHANGELOG.md](CHANGELOG.md)
+> for exactly what a `PASS` means, and [SECURITY.md](SECURITY.md) before
+> reporting anything.
 
 ---
 
