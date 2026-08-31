@@ -19,6 +19,7 @@ package chain
 import (
 	"context"
 	"encoding/json"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -276,4 +277,230 @@ func txFromHash(t *testing.T, ctx context.Context, ec *ethclient.Client, hash st
 		t.Fatalf("fetch tx %s: %v", hash, err)
 	}
 	return tx
+}
+
+// --- publish outcomes -------------------------------------------------------
+//
+// The three outcomes exist because "we do not know" is a real answer.
+// Collapsing it into failure is what causes duplicate publications: a
+// transaction that was replaced, or simply not seen in time, may well have
+// landed.
+
+// hardhatAccount1 is the second well-known account of a Hardhat dev node. It is
+// funded but is NOT the deployed contract's publisher, which makes it the
+// natural way to produce a genuine on-chain revert.
+const hardhatAccount1 = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+
+type realChain struct {
+	rpc     string
+	priv    string
+	ec      *ethclient.Client
+	chainID *big.Int
+	addr    common.Address
+}
+
+func newRealChain(t *testing.T) *realChain {
+	t.Helper()
+	rpc := os.Getenv("TEST_ETH_RPC_URL")
+	priv := os.Getenv("TEST_ETH_PRIVATE_KEY")
+	if rpc == "" || priv == "" {
+		t.Skip("set TEST_ETH_RPC_URL and TEST_ETH_PRIVATE_KEY to run against a real node")
+	}
+
+	raw, err := os.ReadFile(filepath.Clean(
+		"../../contracts/artifacts/contracts/AttestationRegistryV2.sol/AttestationRegistryV2.json"))
+	if err != nil {
+		t.Skipf("compiled artifact not found (run `make contracts-compile`): %v", err)
+	}
+	var artifact struct {
+		ABI      json.RawMessage `json:"abi"`
+		Bytecode string          `json:"bytecode"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("parse artifact: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	ec, err := ethclient.DialContext(ctx, rpc)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(ec.Close)
+	chainID, err := ec.ChainID(ctx)
+	if err != nil {
+		t.Fatalf("chain id: %v", err)
+	}
+
+	key, err := crypto.HexToECDSA(strings.TrimPrefix(priv, "0x"))
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	auth, err := bind.NewKeyedTransactorWithChainID(key, chainID)
+	if err != nil {
+		t.Fatalf("transactor: %v", err)
+	}
+	fullABI, err := abi.JSON(strings.NewReader(string(artifact.ABI)))
+	if err != nil {
+		t.Fatalf("parse artifact ABI: %v", err)
+	}
+	addr, tx, _, err := bind.DeployContract(auth, fullABI, common.FromHex(artifact.Bytecode),
+		ec, crypto.PubkeyToAddress(key.PublicKey))
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if _, err := bind.WaitMined(ctx, ec, tx); err != nil {
+		t.Fatalf("deploy not mined: %v", err)
+	}
+	return &realChain{rpc: rpc, priv: priv, ec: ec, chainID: chainID, addr: addr}
+}
+
+func (r *realChain) writer(t *testing.T, priv string) *ClientV2 {
+	t.Helper()
+	w, err := NewWriterV2(context.Background(), r.rpc, r.addr.Hex(), priv, r.chainID)
+	if err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	t.Cleanup(w.Close)
+	return w
+}
+
+// setAutomine toggles Hardhat's auto-mining. Returns false when the node does
+// not support it, so the timeout case skips rather than lying.
+func (r *realChain) setAutomine(t *testing.T, on bool) bool {
+	t.Helper()
+	var rpcClient = r.ec.Client()
+	if err := rpcClient.CallContext(context.Background(), nil, "evm_setAutomine", on); err != nil {
+		t.Logf("evm_setAutomine unsupported on this node: %v", err)
+		return false
+	}
+	return true
+}
+
+func TestPublishAndWaitReportsMinedSuccess(t *testing.T) {
+	rc := newRealChain(t)
+	w := rc.writer(t, rc.priv)
+
+	res, err := w.PublishAndWait(context.Background(),
+		b32(0xa1), 2, b32(0xb2), b32(0xc3), []byte{0x30, 0x45}, b32(0xd4))
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if res.Outcome != OutcomeMinedSuccess {
+		t.Fatalf("outcome = %s, want mined-success", res.Outcome)
+	}
+	if res.BlockNumber == 0 || res.GasUsed == 0 || res.TxHash == "" {
+		t.Errorf("receipt details missing: %+v", res)
+	}
+
+	got, err := w.LatestAttestation(context.Background(), b32(0xa1))
+	if err != nil || !got.Exists || got.ConfigHash != b32(0xb2) {
+		t.Errorf("a mined-success publish is not readable back: %+v (err %v)", got, err)
+	}
+}
+
+func TestPublishAndWaitReportsRevert(t *testing.T) {
+	rc := newRealChain(t)
+	// Account 1 is funded but is not the contract's publisher, so onlyPublisher
+	// rejects it. A revert must be an OUTCOME, not an error: it is definitive,
+	// so the caller may safely retry, which is different from not knowing.
+	if !rc.setAutomine(t, false) {
+		t.Skip("node cannot pause mining")
+	}
+	t.Cleanup(func() { rc.setAutomine(t, true) })
+
+	intruder := rc.writer(t, hardhatAccount1)
+	// With auto-mining on, the node simulates and refuses a reverting
+	// transaction before it is ever submitted. That is a legitimate rejection,
+	// but it leaves the receipt-status branch -- the one that actually produces
+	// OutcomeReverted -- unexercised. Queueing it first and mining afterwards
+	// is what forces a genuinely mined revert.
+	intruder.auth.GasLimit = 200000
+
+	type outcome struct {
+		res PublishResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := intruder.PublishAndWait(context.Background(),
+			b32(0xa1), 2, b32(0xb2), b32(0xc3), []byte{0x30, 0x45}, b32(0xd4))
+		done <- outcome{res, err}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	if err := rc.ec.Client().CallContext(context.Background(), nil, "evm_mine"); err != nil {
+		t.Fatalf("evm_mine: %v", err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("submission failed before mining, so the revert path was not reached: %v", got.err)
+		}
+		if got.res.Outcome != OutcomeReverted {
+			t.Fatalf("outcome = %s, want reverted", got.res.Outcome)
+		}
+		if got.res.BlockNumber == 0 {
+			t.Error("a reverted transaction was still mined, so it must carry a block number")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("PublishAndWait did not return after the block was mined")
+	}
+
+	got, err := rc.writer(t, rc.priv).LatestAttestation(context.Background(), b32(0xa1))
+	if err != nil {
+		t.Fatalf("getLatest: %v", err)
+	}
+	if got.Exists {
+		t.Error("a reverted transaction still wrote a record")
+	}
+}
+
+func TestPublishAndWaitReportsUnknownWhenNotMined(t *testing.T) {
+	rc := newRealChain(t)
+	if !rc.setAutomine(t, false) {
+		t.Skip("node cannot pause mining")
+	}
+	t.Cleanup(func() { rc.setAutomine(t, true) })
+	w := rc.writer(t, rc.priv)
+
+	// A deadline shorter than publishTimeout wins, so this does not wait 90s.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	res, err := w.PublishAndWait(ctx, b32(0xf1), 2, b32(0xf2), b32(0xf3), []byte{0x30, 0x45}, b32(0xf4))
+	if err != nil {
+		t.Fatalf("publish returned an error for an unmined transaction; it must be an outcome: %v", err)
+	}
+	if res.Outcome != OutcomeUnknown {
+		t.Fatalf("outcome = %s, want unknown", res.Outcome)
+	}
+	if res.TxHash == "" {
+		t.Error("no transaction hash returned; the caller cannot reconcile without one")
+	}
+}
+
+func TestPublishAndWaitTreatsShutdownAsUnknown(t *testing.T) {
+	rc := newRealChain(t)
+	if !rc.setAutomine(t, false) {
+		t.Skip("node cannot pause mining")
+	}
+	t.Cleanup(func() { rc.setAutomine(t, true) })
+	w := rc.writer(t, rc.priv)
+
+	// Cancelling mid-wait is a shutdown, not a failed publication: the
+	// transaction may still land, and recording it as failed would invite a
+	// duplicate on the next start.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(500 * time.Millisecond); cancel() }()
+
+	res, err := w.PublishAndWait(ctx, b32(0xe1), 2, b32(0xe2), b32(0xe3), []byte{0x30, 0x45}, b32(0xe4))
+	if err != nil {
+		t.Fatalf("cancellation produced an error rather than an outcome: %v", err)
+	}
+	if res.Outcome != OutcomeUnknown {
+		t.Fatalf("outcome = %s, want unknown after cancellation", res.Outcome)
+	}
 }

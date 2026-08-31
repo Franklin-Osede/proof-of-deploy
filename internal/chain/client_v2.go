@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
@@ -35,13 +37,9 @@ import (
 // path is built alongside the v1 one and switched over once it is tested, so
 // that a half-migrated client can never be what the operator is running.
 //
-// NOTE ON SCOPE: this client mirrors the v1 operations against the v2 contract
-// and nothing more. In particular PublishAttestation still returns once the
-// transaction is SENT, which is not the same as published. The
-// pending/confirmed/retryable model, receipt waiting, and nonce handling arrive
-// in a later step and will change this signature. That is deliberate — adding a
-// receipt-shaped API now, without the waiting behind it, would be a lie in the
-// type system.
+// Publishing waits for the transaction to be MINED and reports the receipt
+// status. "Mined" is the honest word: this waits for inclusion in a block, not
+// for finality, and a reorg can still undo it.
 type ClientV2 struct {
 	ec       *ethclient.Client
 	contract *bind.BoundContract
@@ -86,10 +84,11 @@ func NewReaderV2(ctx context.Context, rpcURL, contractAddr string) (*ClientV2, e
 
 // newClientV2 binds the registry to an arbitrary backend.
 //
-// Exists so the client can be exercised against an in-process EVM instead of a
-// real node: the decoding of getLatest is the part most able to fail silently
-// (seven return values, a swapped pair would still typecheck), and that
-// deserves a test that does not need a node running.
+// Exists so the client can be bound to any backend rather than only a dialed
+// endpoint. The round-trip test uses a throwaway Hardhat node through this
+// seam; go-ethereum's in-process simulated backend was tried first and is not
+// usable, because it pulls in github.com/fjl/memsize which does not link on
+// current Go toolchains.
 func newClientV2(backend bind.ContractBackend, addr common.Address) (*ClientV2, error) {
 	parsed, err := abi.JSON(strings.NewReader(RegistryV2ABI))
 	if err != nil {
@@ -121,11 +120,102 @@ func NewWriterV2(ctx context.Context, rpcURL, contractAddr, privHex string, chai
 	return c, nil
 }
 
-// PublishAttestation submits a publish transaction and returns the tx hash.
+// PublishOutcome is what actually became of a submitted transaction.
 //
-// It returns once the transaction is SENT. A sent transaction is not a
-// published one: it can be dropped, replaced or reverted. Treating this return
-// as success is the behaviour the next step replaces.
+// There are three, not two, because "we do not know" is a real answer and
+// collapsing it into failure is what causes duplicate publications: a
+// transaction that was replaced, or simply not seen in time, may well have
+// landed. The caller must reconcile against contract state before resending.
+type PublishOutcome int
+
+const (
+	// OutcomeUnknown means the transaction was submitted but not observed in a
+	// block within the timeout. It is neither success nor failure.
+	OutcomeUnknown PublishOutcome = iota
+	// OutcomeMinedSuccess means a receipt was retrieved with status 1. This is
+	// mined, not finalized: a reorg can still undo it.
+	OutcomeMinedSuccess
+	// OutcomeReverted means a receipt was retrieved with status 0. The
+	// transaction definitively did not take effect, so it is safe to retry.
+	OutcomeReverted
+)
+
+func (o PublishOutcome) String() string {
+	switch o {
+	case OutcomeMinedSuccess:
+		return "mined-success"
+	case OutcomeReverted:
+		return "reverted"
+	default:
+		return "unknown"
+	}
+}
+
+// PublishResult describes the fate of a publish attempt.
+type PublishResult struct {
+	TxHash      string
+	Outcome     PublishOutcome
+	BlockNumber uint64
+	GasUsed     uint64
+}
+
+// publishTimeout bounds how long we wait for inclusion before returning
+// OutcomeUnknown. It is not a failure threshold; it is how long we are willing
+// to hold a worker before going and asking the contract instead.
+const publishTimeout = 90 * time.Second
+
+// PublishAndWait submits a publish transaction and waits for it to be mined.
+//
+// It returns an error only for problems that stopped the transaction being
+// submitted at all. Once submitted, the fate of the transaction is carried in
+// the result: a revert and a timeout are outcomes, not errors, because the
+// caller must handle them differently and an error value flattens that.
+//
+// Context cancellation during the wait yields OutcomeUnknown and no error, so a
+// shutdown is not recorded as a failed publication.
+func (c *ClientV2) PublishAndWait(
+	ctx context.Context,
+	workloadID [32]byte,
+	hashVersion uint16,
+	configHash [32]byte,
+	incarnation [32]byte,
+	signature []byte,
+	fingerprint [32]byte,
+) (PublishResult, error) {
+	txHash, err := c.PublishAttestation(ctx, workloadID, hashVersion, configHash, incarnation, signature, fingerprint)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	res := PublishResult{TxHash: txHash, Outcome: OutcomeUnknown}
+
+	tx, _, err := c.ec.TransactionByHash(ctx, common.HexToHash(txHash))
+	if err != nil {
+		// Submitted, but we cannot even look it up. Unknown, not failed.
+		return res, nil
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
+	rcpt, err := bind.WaitMined(waitCtx, c.ec, tx)
+	if err != nil {
+		// Timed out, or the caller cancelled. Either way the transaction may
+		// still land; only contract state can settle it.
+		return res, nil
+	}
+
+	res.BlockNumber = rcpt.BlockNumber.Uint64()
+	res.GasUsed = rcpt.GasUsed
+	if rcpt.Status == ethtypes.ReceiptStatusSuccessful {
+		res.Outcome = OutcomeMinedSuccess
+	} else {
+		res.Outcome = OutcomeReverted
+	}
+	return res, nil
+}
+
+// PublishAttestation submits a publish transaction and returns the tx hash
+// without waiting. Callers that need to know whether it took effect must use
+// PublishAndWait.
 func (c *ClientV2) PublishAttestation(
 	ctx context.Context,
 	workloadID [32]byte,
