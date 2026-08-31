@@ -76,14 +76,27 @@ func NewReaderV2(ctx context.Context, rpcURL, contractAddr string) (*ClientV2, e
 	if err != nil {
 		return nil, fmt.Errorf("chain: dial %q: %w", rpcURL, err)
 	}
+	c, err := newClientV2(ec, common.HexToAddress(contractAddr))
+	if err != nil {
+		return nil, err
+	}
+	c.ec = ec
+	return c, nil
+}
+
+// newClientV2 binds the registry to an arbitrary backend.
+//
+// Exists so the client can be exercised against an in-process EVM instead of a
+// real node: the decoding of getLatest is the part most able to fail silently
+// (seven return values, a swapped pair would still typecheck), and that
+// deserves a test that does not need a node running.
+func newClientV2(backend bind.ContractBackend, addr common.Address) (*ClientV2, error) {
 	parsed, err := abi.JSON(strings.NewReader(RegistryV2ABI))
 	if err != nil {
 		return nil, fmt.Errorf("chain: parse v2 ABI: %w", err)
 	}
-	addr := common.HexToAddress(contractAddr)
 	return &ClientV2{
-		ec:       ec,
-		contract: bind.NewBoundContract(addr, parsed, ec, ec, ec),
+		contract: bind.NewBoundContract(addr, parsed, backend, backend, backend),
 		address:  addr,
 	}, nil
 }
@@ -151,6 +164,17 @@ func (c *ClientV2) LatestAttestation(ctx context.Context, workloadID [32]byte) (
 	if err := c.contract.Call(&bind.CallOpts{Context: ctx}, &out, "getLatest", workloadID); err != nil {
 		return AttestationV2{}, fmt.Errorf("chain: getLatest: %w", err)
 	}
+	return decodeAttestationV2(out)
+}
+
+// decodeAttestationV2 maps getLatest's seven return values onto the struct.
+//
+// Split out so it can be tested without a chain. It is the part of this client
+// most able to fail silently: seven values, several sharing a width, so two
+// transposed would still typecheck and still produce plausible-looking output.
+// The ORDER here must match the Solidity return order exactly, which
+// TestABIMatchesCompiledArtifact enforces from the other direction.
+func decodeAttestationV2(out []interface{}) (AttestationV2, error) {
 	if len(out) != 7 {
 		return AttestationV2{}, fmt.Errorf("chain: getLatest returned %d values, want 7", len(out))
 	}

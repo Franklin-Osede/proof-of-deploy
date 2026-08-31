@@ -71,7 +71,25 @@ jobs:
           npm test
 
       # Runs here rather than in the Go job because it needs the compiled
-      # artifact, which only exists once Hardhat has run. The Go job skips this
-      # test for that reason, so this is the step that actually enforces it.
+      # artifact, which only exists once Hardhat has run. The Go job skips these
+      # for that reason, so this is the step that actually enforces them.
       - name: Go ABI matches the compiled contract
-        run: go test ./internal/chain -run TestABIMatchesCompiledArtifact -v
+        run: go test ./internal/chain -run 'TestABIMatchesCompiledArtifact|TestEveryABIConstantIsGuarded' -v
+
+      # The round trip needs a real EVM: decoding alone could pass while the
+      # encoding side is wrong. go-ethereum's in-process simulated backend is
+      # not usable (github.com/fjl/memsize does not link on current toolchains),
+      # so a throwaway Hardhat node stands in. Without this step the test would
+      # skip in CI and never actually run anywhere.
+      - name: chain client round trip against a real node
+        working-directory: contracts
+        run: |
+          npx hardhat node > /tmp/hardhat-node.log 2>&1 &
+          curl -s --retry 30 --retry-delay 2 --retry-all-errors --max-time 5 \
+            -X POST -H 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
+            http://127.0.0.1:8545 >/dev/null
+          cd ..
+          TEST_ETH_RPC_URL=http://127.0.0.1:8545 \
+          TEST_ETH_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+            go test ./internal/chain -run TestV2RoundTripAgainstRealChain -v
