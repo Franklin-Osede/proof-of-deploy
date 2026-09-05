@@ -92,4 +92,4 @@ jobs:
           cd ..
           TEST_ETH_RPC_URL=http://127.0.0.1:8545 \
           TEST_ETH_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-            go test ./internal/chain -run 'TestV2RoundTripAgainstRealChain|TestPublishAndWait|TestSubmit|TestResend' -v
+            go test ./internal/chain -run 'TestV2RoundTrip|TestPublishAndWait|TestPrepare|TestPreparing|TestResending' -v

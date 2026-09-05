@@ -18,6 +18,7 @@ package chain
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"math/big"
 	"os"
@@ -29,7 +30,6 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
@@ -134,20 +134,22 @@ func TestClientV2RefusesDoomedPublishes(t *testing.T) {
 	readOnly := &ClientV2{}
 	withKey := &ClientV2{auth: &bind.TransactOpts{}}
 
+	// These are checked in Prepare, before anything is signed, so they stay
+	// ordinary errors: they are unambiguously "nothing was submitted".
 	t.Run("read-only client", func(t *testing.T) {
-		if _, err := readOnly.PublishAttestation(ctx, b32(1), 1, b32(2), b32(3), []byte{1}, b32(4)); err == nil {
-			t.Fatal("a client with no signing key published")
+		if _, err := readOnly.Prepare(ctx, b32(1), 1, b32(2), b32(3), []byte{1}, b32(4)); err == nil {
+			t.Fatal("a client with no signing key prepared a transaction")
 		}
 	})
 	t.Run("hash version zero", func(t *testing.T) {
 		// Zero is what an unset record reads back as, so it can never be valid.
-		if _, err := withKey.PublishAttestation(ctx, b32(1), 0, b32(2), b32(3), []byte{1}, b32(4)); err == nil {
+		if _, err := withKey.Prepare(ctx, b32(1), 0, b32(2), b32(3), []byte{1}, b32(4)); err == nil {
 			t.Fatal("version 0 was accepted")
 		}
 	})
 	t.Run("empty signature", func(t *testing.T) {
 		// It could never verify, so publishing it only wastes gas.
-		if _, err := withKey.PublishAttestation(ctx, b32(1), 1, b32(2), b32(3), nil, b32(4)); err == nil {
+		if _, err := withKey.Prepare(ctx, b32(1), 1, b32(2), b32(3), nil, b32(4)); err == nil {
 			t.Fatal("an empty signature was accepted")
 		}
 	})
@@ -231,16 +233,12 @@ func TestV2RoundTripAgainstRealChain(t *testing.T) {
 	signature := []byte{0x30, 0x45, 0x02, 0x21, 0x00, 0xff}
 	const version uint16 = 2
 
-	txHash, err := writer.PublishAttestation(ctx, workloadID, version, configHash, incarnation, signature, fingerprint)
+	res, err := writer.PublishAndWait(ctx, workloadID, version, configHash, incarnation, signature, fingerprint)
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	rcpt, err := bind.WaitMined(ctx, ec, txFromHash(t, ctx, ec, txHash))
-	if err != nil {
-		t.Fatalf("publish not mined: %v", err)
-	}
-	if rcpt.Status != 1 {
-		t.Fatalf("publish reverted, status %d", rcpt.Status)
+	if res.Outcome != OutcomeMinedSuccess {
+		t.Fatalf("outcome = %s, want mined-success", res.Outcome)
 	}
 
 	got, err := writer.LatestAttestation(ctx, workloadID)
@@ -268,15 +266,6 @@ func TestV2RoundTripAgainstRealChain(t *testing.T) {
 	if absent.Exists || absent.HashVersion != 0 || len(absent.Signature) != 0 {
 		t.Errorf("an unpublished identity came back populated: %+v", absent)
 	}
-}
-
-func txFromHash(t *testing.T, ctx context.Context, ec *ethclient.Client, hash string) *types.Transaction {
-	t.Helper()
-	tx, _, err := ec.TransactionByHash(ctx, common.HexToHash(hash))
-	if err != nil {
-		t.Fatalf("fetch tx %s: %v", hash, err)
-	}
-	return tx
 }
 
 // --- publish outcomes -------------------------------------------------------
@@ -505,14 +494,13 @@ func TestPublishAndWaitTreatsShutdownAsUnknown(t *testing.T) {
 	}
 }
 
-// TestSubmitKnowsTheHashBeforeSending is the property that makes reconciliation
-// possible at all.
+// TestPrepareKnowsTheHashBeforeSending is the property that makes
+// reconciliation possible at all.
 //
 // eth_sendRawTransaction can be accepted while the response is lost, so an
 // error from the send is NOT evidence the transaction is absent. Signing
-// locally first means the hash is known either way, and the caller can go and
-// ask the chain instead of guessing.
-func TestSubmitKnowsTheHashBeforeSending(t *testing.T) {
+// locally first means the hash is known either way.
+func TestPrepareKnowsTheHashBeforeSending(t *testing.T) {
 	rc := newRealChain(t)
 	if !rc.setAutomine(t, false) {
 		t.Skip("node cannot pause mining")
@@ -522,44 +510,36 @@ func TestSubmitKnowsTheHashBeforeSending(t *testing.T) {
 	ctx := context.Background()
 
 	wl, cfg := b32(0x71), b32(0x72)
-	res, err := w.Submit(ctx, wl, 2, cfg, b32(0x73), []byte{0x30, 0x45}, b32(0x74))
+	prep, err := w.Prepare(ctx, wl, 2, cfg, b32(0x73), []byte{0x30, 0x45}, b32(0x74))
 	if err != nil {
-		t.Fatalf("submit: %v", err)
+		t.Fatalf("prepare: %v", err)
 	}
-	if res.TxHash == (common.Hash{}) {
-		t.Fatal("no hash returned; reconciliation would have nothing to go on")
+	if prep.TxHash == (common.Hash{}) {
+		t.Fatal("no hash after preparing; reconciliation would have nothing to go on")
 	}
-
-	// Nothing is mined yet, so the hash cannot have come from a receipt: it was
-	// computed locally from the signed transaction.
-	if got, err := w.LatestAttestation(ctx, wl); err != nil || got.Exists {
-		t.Fatalf("record already present before mining (err %v); the test premise is wrong", err)
+	// Nothing has been sent yet, let alone mined, so the hash cannot have come
+	// from the network.
+	if w.Send(ctx, prep) != SubmitAccepted {
+		t.Fatal("send was not accepted")
 	}
-
 	if err := rc.ec.Client().CallContext(ctx, nil, "evm_mine"); err != nil {
 		t.Fatalf("evm_mine: %v", err)
 	}
 	got, err := w.LatestAttestation(ctx, wl)
-	if err != nil {
-		t.Fatalf("getLatest: %v", err)
+	if err != nil || !got.Exists || got.ConfigHash != cfg {
+		t.Fatalf("the prepared transaction never landed: %+v (err %v)", got, err)
 	}
-	if !got.Exists || got.ConfigHash != cfg {
-		t.Fatal("the submitted transaction never landed")
-	}
-	t.Logf("hash %s… was known before the send and the record landed", res.TxHash.Hex()[:18])
+	t.Logf("hash %s… was known before sending", prep.TxHash.Hex()[:18])
 }
 
-// TestResendWithoutReconcilingPublishesTwice is why reconciliation is mandatory
-// rather than merely tidy.
+// TestPreparingTwicePublishesTwice is the hazard, and why a retry must resend
+// the SAME prepared transaction.
 //
-// A retry does NOT resubmit the same transaction. Each attempt takes a fresh
-// pending nonce, so it builds and signs a DIFFERENT transaction with a
-// different hash — and both are valid, so both mine. Anything that treats an
-// unknown outcome as "probably failed, send it again" therefore writes twice.
-//
-// The publisher must query getLatest and only resend when the record is still
-// absent. This test exists so that requirement cannot be quietly dropped.
-func TestResendWithoutReconcilingPublishesTwice(t *testing.T) {
+// Each Prepare takes a fresh pending nonce, so it produces a DIFFERENT, equally
+// valid transaction. Both mine. Querying the contract in between does not help
+// while the first is still pending: it has not reached the contract yet, so the
+// query says absent and the caller sends a second one anyway.
+func TestPreparingTwicePublishesTwice(t *testing.T) {
 	rc := newRealChain(t)
 	if !rc.setAutomine(t, false) {
 		t.Skip("node cannot pause mining")
@@ -569,43 +549,111 @@ func TestResendWithoutReconcilingPublishesTwice(t *testing.T) {
 	ctx := context.Background()
 
 	wl := b32(0x81)
-	first, err := w.Submit(ctx, wl, 2, b32(0x82), b32(0x83), []byte{0x30, 0x45}, b32(0x84))
+	args := []interface{}{}
+	_ = args
+
+	first, err := w.Prepare(ctx, wl, 2, b32(0x82), b32(0x83), []byte{0x30, 0x45}, b32(0x84))
 	if err != nil {
-		t.Fatalf("first submit: %v", err)
+		t.Fatalf("first prepare: %v", err)
 	}
-	// Same arguments, no reconciliation in between: exactly what a naive retry
-	// after an unknown outcome would do.
-	second, err := w.Submit(ctx, wl, 2, b32(0x82), b32(0x83), []byte{0x30, 0x45}, b32(0x84))
-	if err != nil {
-		t.Fatalf("second submit: %v", err)
+	if w.Send(ctx, first) != SubmitAccepted {
+		t.Fatal("first send not accepted")
 	}
 
+	// The reconciliation a naive caller would do, while the first is pending.
+	if got, err := w.LatestAttestation(ctx, wl); err != nil || got.Exists {
+		t.Fatalf("record already on chain while pending (err %v); premise wrong", err)
+	}
+
+	second, err := w.Prepare(ctx, wl, 2, b32(0x82), b32(0x83), []byte{0x30, 0x45}, b32(0x84))
+	if err != nil {
+		t.Fatalf("second prepare: %v", err)
+	}
 	if first.TxHash == second.TxHash {
-		t.Skip("this node deduplicated the resend, so the hazard cannot be shown here")
+		t.Skip("this node reused the nonce, so the hazard cannot be shown here")
 	}
-	t.Logf("a naive retry produced a second distinct transaction: %s… and %s…",
-		first.TxHash.Hex()[:12], second.TxHash.Hex()[:12])
-
+	if w.Send(ctx, second) != SubmitAccepted {
+		t.Fatal("second send not accepted")
+	}
 	if err := rc.ec.Client().CallContext(ctx, nil, "evm_mine"); err != nil {
 		t.Fatalf("evm_mine: %v", err)
 	}
 
-	// Both transactions are valid publishes, so both take effect. The registry
-	// is latest-only, so the second silently overwrote the first — and on a
-	// real network that is two lots of gas for one attestation, plus two
-	// events where a consumer expected one.
 	mined := 0
 	for _, h := range []common.Hash{first.TxHash, second.TxHash} {
-		rcpt, err := rc.ec.TransactionReceipt(ctx, h)
-		if err != nil {
-			continue
-		}
-		if rcpt.Status == 1 {
+		if rcpt, err := rc.ec.TransactionReceipt(ctx, h); err == nil && rcpt.Status == 1 {
 			mined++
 		}
 	}
 	if mined < 2 {
-		t.Fatalf("only %d of the two resends mined; the duplicate-publication hazard is not reproduced", mined)
+		t.Fatalf("only %d of the two preparations mined; the hazard is not reproduced", mined)
 	}
-	t.Log("confirmed: both publications landed. A retry must reconcile against getLatest before resending.")
+	t.Log("confirmed: preparing twice published twice, even with a reconciliation query in between")
+}
+
+// TestResendingThePreparedTransactionIsIdempotent is the fix, and the reason
+// PreparedPublish exists.
+//
+// The same signed bytes carry the same nonce and the same hash, so the node
+// either accepts them or recognises them. However many times it is sent, one
+// transaction mines.
+func TestResendingThePreparedTransactionIsIdempotent(t *testing.T) {
+	rc := newRealChain(t)
+	if !rc.setAutomine(t, false) {
+		t.Skip("node cannot pause mining")
+	}
+	t.Cleanup(func() { rc.setAutomine(t, true) })
+	w := rc.writer(t, rc.priv)
+	ctx := context.Background()
+
+	wl, cfg := b32(0x91), b32(0x92)
+	prep, err := w.Prepare(ctx, wl, 2, cfg, b32(0x93), []byte{0x30, 0x45}, b32(0x94))
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	nonceBefore, err := rc.ec.PendingNonceAt(ctx, crypto.PubkeyToAddress(mustKey(t, rc.priv).PublicKey))
+	if err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+
+	// Three sends of the identical prepared transaction: what a retry loop does
+	// after an unknown outcome.
+	for i := 0; i < 3; i++ {
+		out := w.Send(ctx, prep)
+		t.Logf("send %d: %s", i+1, out)
+	}
+
+	nonceAfter, err := rc.ec.PendingNonceAt(ctx, crypto.PubkeyToAddress(mustKey(t, rc.priv).PublicKey))
+	if err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	// Three sends of identical bytes must consume exactly one nonce. Zero would
+	// mean nothing was sent; more than one would mean each attempt built a
+	// different transaction, which is the hazard this exists to prevent.
+	if got := nonceAfter - nonceBefore; got != 1 {
+		t.Errorf("three sends consumed %d nonces, want exactly 1", got)
+	}
+
+	if err := rc.ec.Client().CallContext(ctx, nil, "evm_mine"); err != nil {
+		t.Fatalf("evm_mine: %v", err)
+	}
+	rcpt, err := rc.ec.TransactionReceipt(ctx, prep.TxHash)
+	if err != nil || rcpt.Status != 1 {
+		t.Fatalf("the prepared transaction did not mine: %v", err)
+	}
+	got, err := w.LatestAttestation(ctx, wl)
+	if err != nil || !got.Exists || got.ConfigHash != cfg {
+		t.Fatalf("record missing after three sends: %+v (err %v)", got, err)
+	}
+	t.Log("confirmed: three sends of one prepared transaction produced exactly one publication")
+}
+
+func mustKey(t *testing.T, priv string) *ecdsa.PrivateKey {
+	t.Helper()
+	k, err := crypto.HexToECDSA(strings.TrimPrefix(priv, "0x"))
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	return k
 }

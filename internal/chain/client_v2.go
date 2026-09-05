@@ -120,23 +120,71 @@ func NewWriterV2(ctx context.Context, rpcURL, contractAddr, privHex string, chai
 	return c, nil
 }
 
+// SubmitOutcome distinguishes a transaction we know the node accepted from one
+// whose delivery is itself uncertain.
+//
+// eth_sendRawTransaction can be accepted while the response is lost to a
+// network cut, and the error the caller then sees is indistinguishable from
+// "never sent". Treating that as failure invites a duplicate publication.
+type SubmitOutcome int
+
+const (
+	// SubmitUnknown means the signed transaction was handed to the node but we
+	// do not know whether it took it. It may be in the mempool.
+	SubmitUnknown SubmitOutcome = iota
+	// SubmitAccepted means the node acknowledged the transaction.
+	SubmitAccepted
+)
+
+func (o SubmitOutcome) String() string {
+	if o == SubmitAccepted {
+		return "accepted"
+	}
+	return "unknown"
+}
+
+// PreparedPublish is a signed publish transaction that has not necessarily been
+// sent yet, held so that RETRIES RESEND THE SAME BYTES.
+//
+// This is what makes a retry safe. Building a fresh transaction per attempt
+// takes a fresh pending nonce and therefore produces a DIFFERENT, equally valid
+// transaction: both mine, and the workload is published twice.
+// TestResendWithoutReconcilingPublishesTwice demonstrates that on a real node.
+//
+// Querying the contract before resending does not close the window on its own.
+// While the first attempt is still pending it has not reached the contract yet,
+// so the query says "absent" and a naive caller sends a second one anyway.
+// Resending identical bytes is idempotent at the node, keeps the hash stable,
+// and lets the receipt and the contract reconcile the same attempt.
+//
+// A prepared transaction does not survive a restart. Nothing here persists it,
+// so exactly-once does not hold across a crash; the operator compensates by
+// querying the contract before publishing anything. That limitation is real and
+// is documented rather than hidden.
+type PreparedPublish struct {
+	// TxHash is known from the moment of signing, before any send.
+	TxHash common.Hash
+
+	tx *ethtypes.Transaction
+}
+
 // PublishOutcome is what actually became of a submitted transaction.
 //
 // There are three, not two, because "we do not know" is a real answer and
-// collapsing it into failure is what causes duplicate publications: a
-// transaction that was replaced, or simply not seen in time, may well have
-// landed. The caller must reconcile against contract state before resending.
+// collapsing it into failure is what causes duplicate publications.
 type PublishOutcome int
 
 const (
-	// OutcomeUnknown means the transaction was submitted but not observed in a
-	// block within the timeout. It is neither success nor failure.
+	// OutcomeUnknown means the transaction was not observed in a block within
+	// the timeout. It is neither success nor failure: it may still land, so the
+	// same prepared transaction should be retried rather than a new one built.
 	OutcomeUnknown PublishOutcome = iota
-	// OutcomeMinedSuccess means a receipt was retrieved with status 1. This is
-	// mined, not finalized: a reorg can still undo it.
+	// OutcomeMinedSuccess means a receipt was retrieved with status 1. Mined,
+	// not finalized: a reorg can still undo it.
 	OutcomeMinedSuccess
 	// OutcomeReverted means a receipt was retrieved with status 0. The
-	// transaction definitively did not take effect, so it is safe to retry.
+	// transaction definitively did not take effect, so the attempt can be
+	// discarded and a fresh one prepared.
 	OutcomeReverted
 )
 
@@ -164,40 +212,15 @@ type PublishResult struct {
 // to hold a worker before going and asking the contract instead.
 const publishTimeout = 90 * time.Second
 
-// SubmitOutcome distinguishes a transaction we know was accepted from one whose
-// submission is itself uncertain.
+// Prepare builds and signs a publish transaction without sending it.
 //
-// The distinction matters because eth_sendRawTransaction can be accepted while
-// the response is lost to a network cut. The error the caller sees is then
-// indistinguishable from "never sent", and treating it as such invites a
-// duplicate publication. Anything that fails BEFORE the transaction is signed
-// -- invalid parameters, no key, a failed nonce or gas lookup -- is
-// unambiguous and stays an ordinary error.
-type SubmitOutcome int
-
-const (
-	// SubmitUnknown means the transaction was signed and handed to the node,
-	// but we do not know whether the node took it. It may be in the mempool.
-	SubmitUnknown SubmitOutcome = iota
-	// SubmitAccepted means the node acknowledged the transaction.
-	SubmitAccepted
-)
-
-// SubmitResult reports what happened to a signed transaction. TxHash is known
-// in both cases, because the transaction is signed locally before it is sent --
-// which is what makes reconciliation possible after a lost response.
-type SubmitResult struct {
-	TxHash  common.Hash
-	Outcome SubmitOutcome
-}
-
-// Submit builds, signs and sends a publish transaction WITHOUT waiting.
+// Every failure here is unambiguous -- bad parameters, no key, a failed nonce
+// or gas lookup -- so they are ordinary errors. Uncertainty begins only once a
+// signed transaction exists.
 //
-// The hash is computed before the send, so a transport failure still yields a
-// hash the caller can reconcile with. An error means the transaction was never
-// signed; a SubmitUnknown outcome means it may or may not have reached the
-// node.
-func (c *ClientV2) Submit(
+// Prepare exactly once per desired revision. Preparing again allocates another
+// nonce and re-introduces the duplicate-publication hazard.
+func (c *ClientV2) Prepare(
 	ctx context.Context,
 	workloadID [32]byte,
 	hashVersion uint16,
@@ -205,81 +228,62 @@ func (c *ClientV2) Submit(
 	incarnation [32]byte,
 	signature []byte,
 	fingerprint [32]byte,
-) (SubmitResult, error) {
+) (*PreparedPublish, error) {
 	if c.auth == nil {
-		return SubmitResult{}, fmt.Errorf("chain: client is read-only; no signing key configured")
+		return nil, fmt.Errorf("chain: client is read-only; no signing key configured")
 	}
 	if hashVersion == 0 {
-		return SubmitResult{}, fmt.Errorf("chain: hash version 0 is not a valid protocol version")
+		return nil, fmt.Errorf("chain: hash version 0 is not a valid protocol version")
 	}
 	if len(signature) == 0 {
-		return SubmitResult{}, fmt.Errorf("chain: refusing to publish an empty signature")
+		return nil, fmt.Errorf("chain: refusing to publish an empty signature")
 	}
 
-	// NoSend builds and signs without dispatching, so the hash is known before
-	// anything leaves this process. Failures up to here -- nonce lookup, gas
-	// estimation, signing -- are unambiguously "not submitted".
 	opts := *c.auth
 	opts.Context = ctx
 	opts.NoSend = true
 	tx, err := c.contract.Transact(&opts, "publish",
 		workloadID, hashVersion, configHash, incarnation, signature, fingerprint)
 	if err != nil {
-		return SubmitResult{}, fmt.Errorf("chain: build publish tx: %w", err)
+		return nil, fmt.Errorf("chain: build publish tx: %w", err)
 	}
-
-	res := SubmitResult{TxHash: tx.Hash(), Outcome: SubmitUnknown}
-	if err := c.ec.SendTransaction(ctx, tx); err != nil {
-		// Signed and possibly delivered. Not an error: only contract state can
-		// settle whether it landed.
-		return res, nil
-	}
-	res.Outcome = SubmitAccepted
-	return res, nil
+	return &PreparedPublish{TxHash: tx.Hash(), tx: tx}, nil
 }
 
-// PublishAndWait submits a publish transaction and waits for it to be mined.
+// Send dispatches a prepared transaction. Sending the same PreparedPublish more
+// than once is safe: the bytes are identical, so the node either accepts it or
+// recognises it, and no second nonce is consumed.
 //
-// It returns an error only for failures that occurred BEFORE the transaction
-// was signed. From the moment a signed transaction exists, every uncertainty is
-// carried in the result rather than in an error, because the caller must
-// reconcile against contract state instead of resending blindly.
-//
-// Context cancellation during the wait yields OutcomeUnknown and no error, so a
-// shutdown is not recorded as a failed publication.
-func (c *ClientV2) PublishAndWait(
-	ctx context.Context,
-	workloadID [32]byte,
-	hashVersion uint16,
-	configHash [32]byte,
-	incarnation [32]byte,
-	signature []byte,
-	fingerprint [32]byte,
-) (PublishResult, error) {
-	sub, err := c.Submit(ctx, workloadID, hashVersion, configHash, incarnation, signature, fingerprint)
-	if err != nil {
-		return PublishResult{}, err
+// There is no error return. A transport failure is not evidence the node lacks
+// the transaction, so it is reported as SubmitUnknown and settled by looking at
+// the chain, never by building a replacement.
+func (c *ClientV2) Send(ctx context.Context, p *PreparedPublish) SubmitOutcome {
+	if p == nil || p.tx == nil {
+		return SubmitUnknown
 	}
-	res := PublishResult{TxHash: sub.TxHash.Hex(), Outcome: OutcomeUnknown}
-	if sub.Outcome == SubmitUnknown {
-		// The node may or may not have it. Waiting on a hash it never saw would
-		// just burn the timeout, so hand the hash back for reconciliation.
-		return res, nil
+	if err := c.ec.SendTransaction(ctx, p.tx); err != nil {
+		return SubmitUnknown
 	}
+	return SubmitAccepted
+}
 
-	tx, _, err := c.ec.TransactionByHash(ctx, sub.TxHash)
-	if err != nil {
-		// Accepted, but we cannot look it up. Unknown, not failed.
-		return res, nil
+// Wait blocks until the prepared transaction is mined, the timeout elapses, or
+// the context is cancelled.
+//
+// Cancellation yields OutcomeUnknown, so a shutdown is never recorded as a
+// failed publication.
+func (c *ClientV2) Wait(ctx context.Context, p *PreparedPublish) PublishResult {
+	res := PublishResult{Outcome: OutcomeUnknown}
+	if p == nil || p.tx == nil {
+		return res
 	}
+	res.TxHash = p.TxHash.Hex()
 
 	waitCtx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
-	rcpt, err := bind.WaitMined(waitCtx, c.ec, tx)
+	rcpt, err := bind.WaitMined(waitCtx, c.ec, p.tx)
 	if err != nil {
-		// Timed out, or the caller cancelled. Either way the transaction may
-		// still land; only contract state can settle it.
-		return res, nil
+		return res
 	}
 
 	res.BlockNumber = rcpt.BlockNumber.Uint64()
@@ -289,13 +293,13 @@ func (c *ClientV2) PublishAndWait(
 	} else {
 		res.Outcome = OutcomeReverted
 	}
-	return res, nil
+	return res
 }
 
-// PublishAttestation submits a publish transaction and returns the tx hash
-// without waiting. Callers that need to know whether it took effect must use
-// PublishAndWait.
-func (c *ClientV2) PublishAttestation(
+// PublishAndWait is Prepare, Send and Wait in one call, for callers with no
+// retry loop of their own. A caller that retries must keep the PreparedPublish
+// and resend it rather than calling this again.
+func (c *ClientV2) PublishAndWait(
 	ctx context.Context,
 	workloadID [32]byte,
 	hashVersion uint16,
@@ -303,27 +307,17 @@ func (c *ClientV2) PublishAttestation(
 	incarnation [32]byte,
 	signature []byte,
 	fingerprint [32]byte,
-) (string, error) {
-	if c.auth == nil {
-		return "", fmt.Errorf("chain: client is read-only; no signing key configured")
-	}
-	// Both are rejected on-chain too. Failing here keeps the wasted gas and the
-	// opaque revert out of the picture.
-	if hashVersion == 0 {
-		return "", fmt.Errorf("chain: hash version 0 is not a valid protocol version")
-	}
-	if len(signature) == 0 {
-		return "", fmt.Errorf("chain: refusing to publish an empty signature")
-	}
-
-	opts := *c.auth
-	opts.Context = ctx
-	tx, err := c.contract.Transact(&opts, "publish",
-		workloadID, hashVersion, configHash, incarnation, signature, fingerprint)
+) (PublishResult, error) {
+	p, err := c.Prepare(ctx, workloadID, hashVersion, configHash, incarnation, signature, fingerprint)
 	if err != nil {
-		return "", fmt.Errorf("chain: publish tx: %w", err)
+		return PublishResult{}, err
 	}
-	return tx.Hash().Hex(), nil
+	if c.Send(ctx, p) == SubmitUnknown {
+		// The node may or may not have it. Waiting on a hash it never saw would
+		// just burn the timeout; hand the hash back for reconciliation.
+		return PublishResult{TxHash: p.TxHash.Hex(), Outcome: OutcomeUnknown}, nil
+	}
+	return c.Wait(ctx, p), nil
 }
 
 // LatestAttestation reads the most recent attestation for a workload ID.
