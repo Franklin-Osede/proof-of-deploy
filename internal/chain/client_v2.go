@@ -164,12 +164,86 @@ type PublishResult struct {
 // to hold a worker before going and asking the contract instead.
 const publishTimeout = 90 * time.Second
 
+// SubmitOutcome distinguishes a transaction we know was accepted from one whose
+// submission is itself uncertain.
+//
+// The distinction matters because eth_sendRawTransaction can be accepted while
+// the response is lost to a network cut. The error the caller sees is then
+// indistinguishable from "never sent", and treating it as such invites a
+// duplicate publication. Anything that fails BEFORE the transaction is signed
+// -- invalid parameters, no key, a failed nonce or gas lookup -- is
+// unambiguous and stays an ordinary error.
+type SubmitOutcome int
+
+const (
+	// SubmitUnknown means the transaction was signed and handed to the node,
+	// but we do not know whether the node took it. It may be in the mempool.
+	SubmitUnknown SubmitOutcome = iota
+	// SubmitAccepted means the node acknowledged the transaction.
+	SubmitAccepted
+)
+
+// SubmitResult reports what happened to a signed transaction. TxHash is known
+// in both cases, because the transaction is signed locally before it is sent --
+// which is what makes reconciliation possible after a lost response.
+type SubmitResult struct {
+	TxHash  common.Hash
+	Outcome SubmitOutcome
+}
+
+// Submit builds, signs and sends a publish transaction WITHOUT waiting.
+//
+// The hash is computed before the send, so a transport failure still yields a
+// hash the caller can reconcile with. An error means the transaction was never
+// signed; a SubmitUnknown outcome means it may or may not have reached the
+// node.
+func (c *ClientV2) Submit(
+	ctx context.Context,
+	workloadID [32]byte,
+	hashVersion uint16,
+	configHash [32]byte,
+	incarnation [32]byte,
+	signature []byte,
+	fingerprint [32]byte,
+) (SubmitResult, error) {
+	if c.auth == nil {
+		return SubmitResult{}, fmt.Errorf("chain: client is read-only; no signing key configured")
+	}
+	if hashVersion == 0 {
+		return SubmitResult{}, fmt.Errorf("chain: hash version 0 is not a valid protocol version")
+	}
+	if len(signature) == 0 {
+		return SubmitResult{}, fmt.Errorf("chain: refusing to publish an empty signature")
+	}
+
+	// NoSend builds and signs without dispatching, so the hash is known before
+	// anything leaves this process. Failures up to here -- nonce lookup, gas
+	// estimation, signing -- are unambiguously "not submitted".
+	opts := *c.auth
+	opts.Context = ctx
+	opts.NoSend = true
+	tx, err := c.contract.Transact(&opts, "publish",
+		workloadID, hashVersion, configHash, incarnation, signature, fingerprint)
+	if err != nil {
+		return SubmitResult{}, fmt.Errorf("chain: build publish tx: %w", err)
+	}
+
+	res := SubmitResult{TxHash: tx.Hash(), Outcome: SubmitUnknown}
+	if err := c.ec.SendTransaction(ctx, tx); err != nil {
+		// Signed and possibly delivered. Not an error: only contract state can
+		// settle whether it landed.
+		return res, nil
+	}
+	res.Outcome = SubmitAccepted
+	return res, nil
+}
+
 // PublishAndWait submits a publish transaction and waits for it to be mined.
 //
-// It returns an error only for problems that stopped the transaction being
-// submitted at all. Once submitted, the fate of the transaction is carried in
-// the result: a revert and a timeout are outcomes, not errors, because the
-// caller must handle them differently and an error value flattens that.
+// It returns an error only for failures that occurred BEFORE the transaction
+// was signed. From the moment a signed transaction exists, every uncertainty is
+// carried in the result rather than in an error, because the caller must
+// reconcile against contract state instead of resending blindly.
 //
 // Context cancellation during the wait yields OutcomeUnknown and no error, so a
 // shutdown is not recorded as a failed publication.
@@ -182,15 +256,20 @@ func (c *ClientV2) PublishAndWait(
 	signature []byte,
 	fingerprint [32]byte,
 ) (PublishResult, error) {
-	txHash, err := c.PublishAttestation(ctx, workloadID, hashVersion, configHash, incarnation, signature, fingerprint)
+	sub, err := c.Submit(ctx, workloadID, hashVersion, configHash, incarnation, signature, fingerprint)
 	if err != nil {
 		return PublishResult{}, err
 	}
-	res := PublishResult{TxHash: txHash, Outcome: OutcomeUnknown}
+	res := PublishResult{TxHash: sub.TxHash.Hex(), Outcome: OutcomeUnknown}
+	if sub.Outcome == SubmitUnknown {
+		// The node may or may not have it. Waiting on a hash it never saw would
+		// just burn the timeout, so hand the hash back for reconciliation.
+		return res, nil
+	}
 
-	tx, _, err := c.ec.TransactionByHash(ctx, common.HexToHash(txHash))
+	tx, _, err := c.ec.TransactionByHash(ctx, sub.TxHash)
 	if err != nil {
-		// Submitted, but we cannot even look it up. Unknown, not failed.
+		// Accepted, but we cannot look it up. Unknown, not failed.
 		return res, nil
 	}
 

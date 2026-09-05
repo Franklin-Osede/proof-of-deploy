@@ -504,3 +504,108 @@ func TestPublishAndWaitTreatsShutdownAsUnknown(t *testing.T) {
 		t.Fatalf("outcome = %s, want unknown after cancellation", res.Outcome)
 	}
 }
+
+// TestSubmitKnowsTheHashBeforeSending is the property that makes reconciliation
+// possible at all.
+//
+// eth_sendRawTransaction can be accepted while the response is lost, so an
+// error from the send is NOT evidence the transaction is absent. Signing
+// locally first means the hash is known either way, and the caller can go and
+// ask the chain instead of guessing.
+func TestSubmitKnowsTheHashBeforeSending(t *testing.T) {
+	rc := newRealChain(t)
+	if !rc.setAutomine(t, false) {
+		t.Skip("node cannot pause mining")
+	}
+	t.Cleanup(func() { rc.setAutomine(t, true) })
+	w := rc.writer(t, rc.priv)
+	ctx := context.Background()
+
+	wl, cfg := b32(0x71), b32(0x72)
+	res, err := w.Submit(ctx, wl, 2, cfg, b32(0x73), []byte{0x30, 0x45}, b32(0x74))
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if res.TxHash == (common.Hash{}) {
+		t.Fatal("no hash returned; reconciliation would have nothing to go on")
+	}
+
+	// Nothing is mined yet, so the hash cannot have come from a receipt: it was
+	// computed locally from the signed transaction.
+	if got, err := w.LatestAttestation(ctx, wl); err != nil || got.Exists {
+		t.Fatalf("record already present before mining (err %v); the test premise is wrong", err)
+	}
+
+	if err := rc.ec.Client().CallContext(ctx, nil, "evm_mine"); err != nil {
+		t.Fatalf("evm_mine: %v", err)
+	}
+	got, err := w.LatestAttestation(ctx, wl)
+	if err != nil {
+		t.Fatalf("getLatest: %v", err)
+	}
+	if !got.Exists || got.ConfigHash != cfg {
+		t.Fatal("the submitted transaction never landed")
+	}
+	t.Logf("hash %s… was known before the send and the record landed", res.TxHash.Hex()[:18])
+}
+
+// TestResendWithoutReconcilingPublishesTwice is why reconciliation is mandatory
+// rather than merely tidy.
+//
+// A retry does NOT resubmit the same transaction. Each attempt takes a fresh
+// pending nonce, so it builds and signs a DIFFERENT transaction with a
+// different hash — and both are valid, so both mine. Anything that treats an
+// unknown outcome as "probably failed, send it again" therefore writes twice.
+//
+// The publisher must query getLatest and only resend when the record is still
+// absent. This test exists so that requirement cannot be quietly dropped.
+func TestResendWithoutReconcilingPublishesTwice(t *testing.T) {
+	rc := newRealChain(t)
+	if !rc.setAutomine(t, false) {
+		t.Skip("node cannot pause mining")
+	}
+	t.Cleanup(func() { rc.setAutomine(t, true) })
+	w := rc.writer(t, rc.priv)
+	ctx := context.Background()
+
+	wl := b32(0x81)
+	first, err := w.Submit(ctx, wl, 2, b32(0x82), b32(0x83), []byte{0x30, 0x45}, b32(0x84))
+	if err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+	// Same arguments, no reconciliation in between: exactly what a naive retry
+	// after an unknown outcome would do.
+	second, err := w.Submit(ctx, wl, 2, b32(0x82), b32(0x83), []byte{0x30, 0x45}, b32(0x84))
+	if err != nil {
+		t.Fatalf("second submit: %v", err)
+	}
+
+	if first.TxHash == second.TxHash {
+		t.Skip("this node deduplicated the resend, so the hazard cannot be shown here")
+	}
+	t.Logf("a naive retry produced a second distinct transaction: %s… and %s…",
+		first.TxHash.Hex()[:12], second.TxHash.Hex()[:12])
+
+	if err := rc.ec.Client().CallContext(ctx, nil, "evm_mine"); err != nil {
+		t.Fatalf("evm_mine: %v", err)
+	}
+
+	// Both transactions are valid publishes, so both take effect. The registry
+	// is latest-only, so the second silently overwrote the first — and on a
+	// real network that is two lots of gas for one attestation, plus two
+	// events where a consumer expected one.
+	mined := 0
+	for _, h := range []common.Hash{first.TxHash, second.TxHash} {
+		rcpt, err := rc.ec.TransactionReceipt(ctx, h)
+		if err != nil {
+			continue
+		}
+		if rcpt.Status == 1 {
+			mined++
+		}
+	}
+	if mined < 2 {
+		t.Fatalf("only %d of the two resends mined; the duplicate-publication hazard is not reproduced", mined)
+	}
+	t.Log("confirmed: both publications landed. A retry must reconcile against getLatest before resending.")
+}
