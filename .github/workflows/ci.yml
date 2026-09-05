@@ -41,6 +41,11 @@ jobs:
       - name: test
         run: make test
 
+      # The publisher is a concurrent state machine whose whole job is to not
+      # publish twice. Data races there would be invisible in ordinary runs.
+      - name: race detector
+        run: go test -race ./internal/publisher/... ./internal/controller/...
+
       # The v2 golden vectors are pinned by Go tests that use the same encoder
       # they are checking, which proves determinism but not correctness. This
       # re-derives them with an independent implementation written from the

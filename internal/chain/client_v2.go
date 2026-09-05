@@ -250,21 +250,48 @@ func (c *ClientV2) Prepare(
 	return &PreparedPublish{TxHash: tx.Hash(), tx: tx}, nil
 }
 
+// SendResult reports what a dispatch attempt achieved.
+//
+// Outcome decides state. Cause never does: it is diagnosis only, kept so a
+// sustained RPC outage shows up in logs, metrics and readiness instead of
+// disappearing into an unexplained stream of unknowns. Reading Cause as failure
+// would undo the entire point of the three-outcome model.
+type SendResult struct {
+	Outcome SubmitOutcome
+	// Cause is the transport error, when there was one. A non-nil Cause does
+	// NOT mean the node lacks the transaction.
+	Cause error
+}
+
 // Send dispatches a prepared transaction. Sending the same PreparedPublish more
 // than once is safe: the bytes are identical, so the node either accepts it or
 // recognises it, and no second nonce is consumed.
 //
-// There is no error return. A transport failure is not evidence the node lacks
-// the transaction, so it is reported as SubmitUnknown and settled by looking at
-// the chain, never by building a replacement.
-func (c *ClientV2) Send(ctx context.Context, p *PreparedPublish) SubmitOutcome {
+// The error return is for unambiguous programming faults -- a nil or unsigned
+// PreparedPublish, or a client with no connection -- where we know for certain
+// nothing was sent. Uncertainty begins only once SendTransaction has been
+// attempted; folding these cases into SubmitUnknown would hide a bug behind a
+// state the caller is designed to tolerate.
+func (c *ClientV2) Send(ctx context.Context, p *PreparedPublish) (SendResult, error) {
 	if p == nil || p.tx == nil {
-		return SubmitUnknown
+		return SendResult{}, fmt.Errorf("chain: send called with no prepared transaction")
+	}
+	if c.ec == nil {
+		return SendResult{}, fmt.Errorf("chain: client has no connection")
 	}
 	if err := c.ec.SendTransaction(ctx, p.tx); err != nil {
-		return SubmitUnknown
+		// Possibly delivered. Only the chain can settle it.
+		return SendResult{Outcome: SubmitUnknown, Cause: err}, nil
 	}
-	return SubmitAccepted
+	return SendResult{Outcome: SubmitAccepted}, nil
+}
+
+// Hash returns the transaction hash, known from the moment of signing.
+func (p *PreparedPublish) Hash() string {
+	if p == nil {
+		return ""
+	}
+	return p.TxHash.Hex()
 }
 
 // Wait blocks until the prepared transaction is mined, the timeout elapses, or
@@ -312,9 +339,18 @@ func (c *ClientV2) PublishAndWait(
 	if err != nil {
 		return PublishResult{}, err
 	}
-	if c.Send(ctx, p) == SubmitUnknown {
-		// The node may or may not have it. Waiting on a hash it never saw would
-		// just burn the timeout; hand the hash back for reconciliation.
+	sent, err := c.Send(ctx, p)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	if sent.Outcome == SubmitUnknown {
+		// SHORTCUT, and only acceptable in this helper: return rather than
+		// burn the timeout waiting on a hash the node may never have seen.
+		//
+		// A retry loop must NOT copy this. "Already known" also reports
+		// unknown, and in that case the transaction is at the node and will
+		// mine, so a state machine has to Wait or reconcile rather than
+		// assume nothing happened.
 		return PublishResult{TxHash: p.TxHash.Hex(), Outcome: OutcomeUnknown}, nil
 	}
 	return c.Wait(ctx, p), nil

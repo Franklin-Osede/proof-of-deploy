@@ -519,7 +519,7 @@ func TestPrepareKnowsTheHashBeforeSending(t *testing.T) {
 	}
 	// Nothing has been sent yet, let alone mined, so the hash cannot have come
 	// from the network.
-	if w.Send(ctx, prep) != SubmitAccepted {
+	if sent, err := w.Send(ctx, prep); err != nil || sent.Outcome != SubmitAccepted {
 		t.Fatal("send was not accepted")
 	}
 	if err := rc.ec.Client().CallContext(ctx, nil, "evm_mine"); err != nil {
@@ -549,14 +549,11 @@ func TestPreparingTwicePublishesTwice(t *testing.T) {
 	ctx := context.Background()
 
 	wl := b32(0x81)
-	args := []interface{}{}
-	_ = args
-
 	first, err := w.Prepare(ctx, wl, 2, b32(0x82), b32(0x83), []byte{0x30, 0x45}, b32(0x84))
 	if err != nil {
 		t.Fatalf("first prepare: %v", err)
 	}
-	if w.Send(ctx, first) != SubmitAccepted {
+	if sent, err := w.Send(ctx, first); err != nil || sent.Outcome != SubmitAccepted {
 		t.Fatal("first send not accepted")
 	}
 
@@ -572,7 +569,7 @@ func TestPreparingTwicePublishesTwice(t *testing.T) {
 	if first.TxHash == second.TxHash {
 		t.Skip("this node reused the nonce, so the hazard cannot be shown here")
 	}
-	if w.Send(ctx, second) != SubmitAccepted {
+	if sent, err := w.Send(ctx, second); err != nil || sent.Outcome != SubmitAccepted {
 		t.Fatal("second send not accepted")
 	}
 	if err := rc.ec.Client().CallContext(ctx, nil, "evm_mine"); err != nil {
@@ -620,8 +617,11 @@ func TestResendingThePreparedTransactionIsIdempotent(t *testing.T) {
 	// Three sends of the identical prepared transaction: what a retry loop does
 	// after an unknown outcome.
 	for i := 0; i < 3; i++ {
-		out := w.Send(ctx, prep)
-		t.Logf("send %d: %s", i+1, out)
+		out, err := w.Send(ctx, prep)
+		if err != nil {
+			t.Fatalf("send %d returned an error; only programming faults may: %v", i+1, err)
+		}
+		t.Logf("send %d: %s (cause: %v)", i+1, out.Outcome, out.Cause)
 	}
 
 	nonceAfter, err := rc.ec.PendingNonceAt(ctx, crypto.PubkeyToAddress(mustKey(t, rc.priv).PublicKey))
