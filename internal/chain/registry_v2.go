@@ -23,9 +23,10 @@ package chain
 // declared here against that artifact on every CI run. Editing this constant
 // without a matching Solidity change fails the build.
 //
-// Only the three entries the Go side actually uses are declared. The contract
-// also exposes `publisher()`, which is read during startup validation in a
-// later step; it will be added here then, not speculatively now.
+// Only the entries the Go side actually uses are declared. publisher() is here
+// because startup validation reads it: the address it returns is spliced into
+// the runtime template to prove the deployed code really is this contract,
+// compiled for this publisher.
 const RegistryV2ABI = `[
   {
     "type": "event",
@@ -141,5 +142,17 @@ const RegistryV2ABI = `[
       }
     ],
     "outputs": []
+  },
+  {
+    "type": "function",
+    "name": "publisher",
+    "stateMutability": "view",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address"
+      }
+    ]
   }
 ]`

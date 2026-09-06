@@ -79,7 +79,7 @@ jobs:
       # artifact, which only exists once Hardhat has run. The Go job skips these
       # for that reason, so this is the step that actually enforces them.
       - name: Go ABI matches the compiled contract
-        run: go test ./internal/chain -run 'TestABIMatchesCompiledArtifact|TestEveryABIConstantIsGuarded' -v
+        run: go test ./internal/chain -run 'TestABIMatchesCompiledArtifact|TestEveryABIConstantIsGuarded|TestRuntimeTemplateMatchesBuildInfo' -v
 
       # The round trip needs a real EVM: decoding alone could pass while the
       # encoding side is wrong. go-ethereum's in-process simulated backend is
@@ -97,4 +97,4 @@ jobs:
           cd ..
           TEST_ETH_RPC_URL=http://127.0.0.1:8545 \
           TEST_ETH_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-            go test ./internal/chain -run 'TestV2RoundTrip|TestPublishAndWait|TestPrepare|TestPreparing|TestResending' -v
+            go test ./internal/chain -run 'TestV2RoundTrip|TestPublishAndWait|TestPrepare|TestPreparing|TestResending|TestValidate' -v
