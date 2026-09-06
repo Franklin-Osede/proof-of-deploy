@@ -34,7 +34,11 @@ import (
 
 // --- fakes ------------------------------------------------------------------
 
+// fakeSigner signs for real. A stub returning arbitrary bytes would make the
+// reconciliation tests meaningless, since the whole point is that a record is
+// accepted only when its signature verifies.
 type fakeSigner struct {
+	key   *ecdsa.PrivateKey
 	der   []byte
 	calls int
 	err   error
@@ -50,7 +54,7 @@ func newFakeSigner(t *testing.T) *fakeSigner {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	return &fakeSigner{der: der}
+	return &fakeSigner{key: k, der: der}
 }
 
 func (f *fakeSigner) PublicKeyDER() []byte { return f.der }
@@ -59,7 +63,22 @@ func (f *fakeSigner) SignDigest(_ context.Context, d [32]byte) ([]byte, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	return append([]byte{0x30, 0x45}, d[:8]...), nil
+	return ecdsa.SignASN1(rand.Reader, f.key, d[:])
+}
+
+// sign produces the signature this signer would have made for a revision,
+// without going through the publisher. Used to plant on-chain records.
+func (f *fakeSigner) sign(t *testing.T, p *PublisherV2, d Desired) []byte {
+	t.Helper()
+	digest, err := p.envelopeFor(d).SigningDigest()
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	sig, err := ecdsa.SignASN1(rand.Reader, f.key, digest[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return sig
 }
 
 type fakeTx struct{ hash string }
@@ -71,11 +90,12 @@ func (f fakeTx) Hash() string { return f.hash }
 type fakeChain struct {
 	mu sync.Mutex
 
-	record   *RevisionKey // nil means absent
-	prepares int
-	sends    int
-	waits    int
-	prepared []PreparedTx
+	record    *RevisionKey // nil means absent
+	recordSig []byte
+	prepares  int
+	sends     int
+	waits     int
+	prepared  []PreparedTx
 
 	latestErr error
 	onPrepare func(key RevisionKey) (SendOutcome, WaitOutcome)
@@ -94,7 +114,7 @@ func (c *fakeChain) Latest(_ context.Context, _ [32]byte) (OnChain, error) {
 	if c.record == nil {
 		return OnChain{}, nil
 	}
-	return OnChain{Exists: true, Key: *c.record}, nil
+	return OnChain{Exists: true, Key: *c.record, Signature: c.recordSig}, nil
 }
 
 func (c *fakeChain) Prepare(_ context.Context, _ [32]byte, key RevisionKey, sig []byte) (PreparedTx, error) {
@@ -131,10 +151,11 @@ func (c *fakeChain) Wait(_ context.Context, p PreparedTx) (WaitOutcome, error) {
 	return out, nil
 }
 
-func (c *fakeChain) setRecord(k RevisionKey) {
+func (c *fakeChain) setRecord(k RevisionKey, sig []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.record = &k
+	c.recordSig = sig
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -161,7 +182,11 @@ func newTestPublisher(t *testing.T) (*PublisherV2, *fakeChain, *fakeSigner) {
 	t.Helper()
 	s := newFakeSigner(t)
 	c := &fakeChain{sendOut: SendAccepted, waitOut: WaitMinedSuccess}
-	return NewV2(s, c, logr.Discard()), c, s
+	p, err := NewV2(s, c, logr.Discard())
+	if err != nil {
+		t.Fatalf("NewV2: %v", err)
+	}
+	return p, c, s
 }
 
 func mustID(t *testing.T, d Desired) [32]byte {
@@ -250,7 +275,7 @@ func TestMatchingRecordConfirmsWithoutPublishing(t *testing.T) {
 	// exactly this revision.
 	p, c, s := newTestPublisher(t)
 	d := desired("api", 0x11, "uid-1")
-	c.setRecord(p.revisionKey(d))
+	c.setRecord(p.revisionKey(d), s.sign(t, p, d))
 	_ = p.Enqueue(d)
 
 	if _, err := p.process(context.Background(), mustID(t, d)); err != nil {
@@ -267,8 +292,9 @@ func TestDifferentRecordDoesNotConfirm(t *testing.T) {
 	p, c, _ := newTestPublisher(t)
 	d := desired("api", 0x11, "uid-1")
 
-	other := p.revisionKey(desired("api", 0x11, "uid-DIFFERENT"))
-	c.setRecord(other)
+	otherDesired := desired("api", 0x11, "uid-DIFFERENT")
+	other := p.revisionKey(otherDesired)
+	c.setRecord(other, newFakeSigner(t).sign(t, p, otherDesired))
 	_ = p.Enqueue(d)
 
 	if _, err := p.process(context.Background(), mustID(t, d)); err != nil {
@@ -286,14 +312,19 @@ func TestDifferentRecordDoesNotConfirm(t *testing.T) {
 func TestRestartDoesNotRepublish(t *testing.T) {
 	s1 := newFakeSigner(t)
 	chain := &fakeChain{sendOut: SendAccepted, waitOut: WaitUnknown}
-	first := NewV2(s1, chain, logr.Discard())
+	first, err := NewV2(s1, chain, logr.Discard())
+	if err != nil {
+		t.Fatalf("NewV2: %v", err)
+	}
 
 	d := desired("api", 0x11, "uid-1")
 	_ = first.Enqueue(d)
 	id := mustID(t, d)
 
 	// The transaction is sent and mines, but the receipt never comes back.
-	chain.onWait = func(c *fakeChain, _ PreparedTx) { c.setRecord(first.revisionKey(d)) }
+	chain.onWait = func(c *fakeChain, _ PreparedTx) {
+		c.setRecord(first.revisionKey(d), s1.sign(t, first, d))
+	}
 	if _, err := first.process(context.Background(), id); err != nil {
 		// It reconciles immediately here; either way it must not have published
 		// a second time.
@@ -305,7 +336,10 @@ func TestRestartDoesNotRepublish(t *testing.T) {
 	// Restart: a brand new publisher with no memory of the attempt, using the
 	// same key so the fingerprint matches.
 	chain.onWait = nil
-	second := NewV2(&fakeSigner{der: s1.der}, chain, logr.Discard())
+	second, err := NewV2(&fakeSigner{key: s1.key, der: s1.der}, chain, logr.Discard())
+	if err != nil {
+		t.Fatalf("NewV2 after restart: %v", err)
+	}
 	_ = second.Enqueue(d)
 	if _, err := second.process(context.Background(), id); err != nil {
 		t.Fatalf("after restart: %v", err)
@@ -321,7 +355,7 @@ func TestRestartDoesNotRepublish(t *testing.T) {
 // unknown, B arrives, A mines late, B is still what is wanted, and no later
 // retry of A may overwrite it.
 func TestNewRevisionSupersedesAnOldInFlightOne(t *testing.T) {
-	p, c, _ := newTestPublisher(t)
+	p, c, sgn := newTestPublisher(t)
 	c.waitOut = WaitUnknown
 
 	revA := desired("api", 0x11, "uid-1")
@@ -340,7 +374,7 @@ func TestNewRevisionSupersedesAnOldInFlightOne(t *testing.T) {
 	_ = p.Enqueue(revB)
 
 	// A mines late. The chain now holds A, which is no longer desired.
-	c.setRecord(keyA)
+	c.setRecord(keyA, sgn.sign(t, p, revA))
 	c.waitOut = WaitMinedSuccess
 
 	if _, err := p.process(context.Background(), id); err != nil {
@@ -488,5 +522,138 @@ func TestRevisionArrivingMidFlightIsNotLost(t *testing.T) {
 	}
 	if c.prepares != preparesBefore+1 {
 		t.Errorf("B was not published: prepares %d -> %d", preparesBefore, c.prepares)
+	}
+}
+
+// --- reconciliation verifies, it does not merely compare --------------------
+//
+// A record carries the fingerprint its WRITER chose. Matching fields therefore
+// prove only that somebody claimed our key, which is why confirmation requires
+// the signature to verify against the envelope we would have signed.
+
+// TestRecordWithForeignSignatureIsNotConfirmed is the attack the field
+// comparison alone would miss: an account able to write puts our fingerprint
+// next to a signature we did not make.
+//
+// Without verification the operator would mark the workload confirmed and stop
+// publishing, leaving it looking attested while pod-verify reports FAIL.
+func TestRecordWithForeignSignatureIsNotConfirmed(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	d := desired("api", 0x11, "uid-1")
+
+	// Every field matches. The signature is from a different key.
+	impostor := newFakeSigner(t)
+	c.setRecord(p.revisionKey(d), impostor.sign(t, p, d))
+	_ = p.Enqueue(d)
+
+	if _, err := p.process(context.Background(), mustID(t, d)); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if c.prepares != 1 || s.calls != 1 {
+		t.Errorf("a record signed by another key was accepted as ours: prepares=%d signs=%d",
+			c.prepares, s.calls)
+	}
+}
+
+// TestRecordWithMalformedSignatureIsNotConfirmed covers the cheaper version of
+// the same attack: matching fields with bytes that are not a signature at all,
+// including none.
+func TestRecordWithMalformedSignatureIsNotConfirmed(t *testing.T) {
+	for name, sig := range map[string][]byte{
+		"empty":     {},
+		"nil":       nil,
+		"garbage":   {0x30, 0x45, 0x02, 0x01, 0x00},
+		"truncated": {0x30},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, c, _ := newTestPublisher(t)
+			d := desired("api", 0x11, "uid-1")
+			c.setRecord(p.revisionKey(d), sig)
+			_ = p.Enqueue(d)
+
+			if _, err := p.process(context.Background(), mustID(t, d)); err != nil {
+				t.Fatalf("process: %v", err)
+			}
+			if c.prepares != 1 {
+				t.Errorf("a record with a %s signature was accepted", name)
+			}
+		})
+	}
+}
+
+// TestSignatureOverDifferentContentIsNotConfirmed is the tampering case.
+//
+// The signature is genuine and from our own key, but it was made over a
+// different envelope. The digest therefore differs and verification fails, so a
+// record cannot be assembled from a signature harvested elsewhere.
+func TestSignatureOverDifferentContentIsNotConfirmed(t *testing.T) {
+	cases := map[string]func(Desired) Desired{
+		"different UID": func(d Desired) Desired {
+			d.UID = "uid-SOMETHING-ELSE"
+			return d
+		},
+		"different namespace": func(d Desired) Desired {
+			d.Identity.Namespace = "other"
+			return d
+		},
+		"different cluster": func(d Desired) Desired {
+			d.Identity.ClusterID = "another-cluster"
+			return d
+		},
+		"different config hash": func(d Desired) Desired {
+			d.ConfigHash[0] ^= 0xff
+			return d
+		},
+	}
+
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			p, c, s := newTestPublisher(t)
+			want := desired("api", 0x11, "uid-1")
+
+			// Sign a DIFFERENT envelope with the right key, then file it under
+			// the key fields of the revision we want.
+			harvested := s.sign(t, p, mutate(want))
+			c.setRecord(p.revisionKey(want), harvested)
+			signsBefore := s.calls
+			_ = p.Enqueue(want)
+
+			if _, err := p.process(context.Background(), mustID(t, want)); err != nil {
+				t.Fatalf("process: %v", err)
+			}
+			if c.prepares != 1 || s.calls != signsBefore+1 {
+				t.Errorf("a signature over %s was accepted for this revision", name)
+			}
+		})
+	}
+}
+
+// TestValidRecordConfirmsWithoutTouchingKMS states the other half: when the
+// signature does verify, nothing is signed and nothing is published. This is
+// what makes a restart cheap instead of a fresh KMS call per workload.
+func TestValidRecordConfirmsWithoutTouchingKMS(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	d := desired("api", 0x11, "uid-1")
+	c.setRecord(p.revisionKey(d), s.sign(t, p, d))
+	signsBefore := s.calls
+	_ = p.Enqueue(d)
+
+	if _, err := p.process(context.Background(), mustID(t, d)); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if s.calls != signsBefore {
+		t.Errorf("called KMS %d times to confirm a record it could verify locally", s.calls-signsBefore)
+	}
+	if c.prepares != 0 || c.sends != 0 {
+		t.Errorf("published over a valid record: prepares=%d sends=%d", c.prepares, c.sends)
+	}
+}
+
+// TestNewV2RejectsAnUnparseableSignerKey pins that a bad key fails at
+// construction rather than at the first publication.
+func TestNewV2RejectsAnUnparseableSignerKey(t *testing.T) {
+	bad := &fakeSigner{der: []byte("not a DER public key")}
+	if _, err := NewV2(bad, &fakeChain{}, logr.Discard()); err == nil {
+		t.Fatal("a signer whose public key cannot be parsed was accepted")
 	}
 }

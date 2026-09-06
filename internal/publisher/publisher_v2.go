@@ -18,6 +18,7 @@ package publisher
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"sync"
 	"time"
@@ -65,6 +66,9 @@ type PublisherV2 struct {
 	// and knowing it without signing is what lets the pre-send reconciliation
 	// match a complete revision before any KMS call is made.
 	fingerprint [32]byte
+	// pub is the same key, parsed once, so reconciliation can VERIFY an
+	// on-chain signature rather than merely compare a fingerprint to it.
+	pub *ecdsa.PublicKey
 
 	mu    sync.Mutex
 	state map[[32]byte]*workloadState
@@ -99,9 +103,17 @@ type RevisionKey struct {
 }
 
 // OnChain is the registry's view of a workload.
+//
+// Signature is carried because the key fields alone cannot establish that a
+// record is ours. The fingerprint in a record is a value the WRITER chose: an
+// account able to write can put our fingerprint next to a meaningless
+// signature. Confirming on field equality would then leave the workload
+// looking attested while no valid attestation exists, and the operator would
+// stop trying to publish one.
 type OnChain struct {
-	Exists bool
-	Key    RevisionKey
+	Exists    bool
+	Key       RevisionKey
+	Signature []byte
 }
 
 // PreparedTx is an opaque handle to a signed, unsent transaction. The publisher
@@ -153,9 +165,18 @@ type workloadState struct {
 	confirmed *RevisionKey
 }
 
-// NewV2 builds a publisher. The signer's public key is read once so the
-// fingerprint is available without signing.
-func NewV2(signer Signer, chain ChainV2, log logr.Logger) *PublisherV2 {
+// NewV2 builds a publisher. The signer's public key is read and parsed once:
+// the fingerprint lets reconciliation match a revision without signing, and the
+// parsed key lets it verify what it matched.
+//
+// A signer whose public key cannot be parsed is a configuration fault, so it
+// fails here rather than at the first publication.
+func NewV2(signer Signer, chain ChainV2, log logr.Logger) (*PublisherV2, error) {
+	der := signer.PublicKeyDER()
+	pub, err := attest.ParsePublicKeyDER(der)
+	if err != nil {
+		return nil, fmt.Errorf("publisher: signer public key: %w", err)
+	}
 	return &PublisherV2{
 		queue: workqueue.NewRateLimitingQueue(
 			workqueue.NewItemExponentialFailureRateLimiter(1*time.Second, 5*time.Minute),
@@ -163,9 +184,41 @@ func NewV2(signer Signer, chain ChainV2, log logr.Logger) *PublisherV2 {
 		signer:      signer,
 		chain:       chain,
 		log:         log.WithName("publisher-v2"),
-		fingerprint: attest.PublicKeyFingerprintBytes(signer.PublicKeyDER()),
+		fingerprint: attest.PublicKeyFingerprintBytes(der),
+		pub:         pub,
 		state:       make(map[[32]byte]*workloadState),
+	}, nil
+}
+
+// envelopeFor rebuilds the signed envelope for a revision. It is the same
+// construction the signing path uses, which is what makes verification
+// meaningful rather than a second, subtly different opinion.
+func (p *PublisherV2) envelopeFor(d Desired) attest.EnvelopeV2 {
+	return attest.EnvelopeV2{
+		Version:    d.Version,
+		Identity:   d.Identity,
+		UID:        d.UID,
+		ConfigHash: d.ConfigHash,
 	}
+}
+
+// recordIsOurs reports whether an on-chain record really is this revision,
+// signed by this signer.
+//
+// Field equality is not enough. A record carries the fingerprint its writer
+// chose, so matching fields prove only that somebody claimed our key. The
+// signature is what proves it: it is verified against the envelope rebuilt from
+// what we want, so any difference in identity, incarnation, version or config
+// makes the digest differ and verification fail.
+func (p *PublisherV2) recordIsOurs(d Desired, sig []byte) bool {
+	if len(sig) == 0 {
+		return false
+	}
+	digest, err := p.envelopeFor(d).SigningDigest()
+	if err != nil {
+		return false
+	}
+	return attest.VerifyConfigHashSignature(p.pub, digest, sig)
 }
 
 // Enqueue records a desired revision. It never blocks and never signs, so the
@@ -213,11 +266,10 @@ func (p *PublisherV2) Enqueue(d Desired) error {
 }
 
 func (p *PublisherV2) revisionKey(d Desired) RevisionKey {
-	env := attest.EnvelopeV2{Version: d.Version, Identity: d.Identity, UID: d.UID, ConfigHash: d.ConfigHash}
 	return RevisionKey{
 		Version:     uint16(d.Version),
 		ConfigHash:  d.ConfigHash,
-		Incarnation: env.Incarnation(),
+		Incarnation: p.envelopeFor(d).Incarnation(),
 		Fingerprint: p.fingerprint,
 	}
 }
@@ -278,7 +330,15 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 		return false, fmt.Errorf("reading current attestation: %w", err)
 	}
 	if onchain.Exists && onchain.Key == rev.key {
-		return p.confirm(id, rev), nil
+		if p.recordIsOurs(rev.desired, onchain.Signature) {
+			return p.confirm(id, rev), nil
+		}
+		// Every field matches and the signature does not verify. Something
+		// wrote our fingerprint over a signature we did not make. Publishing a
+		// correct record is the only response available here; the operator
+		// cannot remove the bad one.
+		p.log.Info("on-chain record matches this revision but its signature does not verify; republishing",
+			"deployment", rev.desired.Label)
 	}
 
 	prepared, err := p.prepareOnce(ctx, id, rev)
@@ -324,7 +384,8 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 		// settle it. Reconcile immediately so a lost receipt does not cost a
 		// whole backoff cycle.
 		latest, lerr := p.chain.Latest(ctx, id)
-		if lerr == nil && latest.Exists && latest.Key == rev.key {
+		if lerr == nil && latest.Exists && latest.Key == rev.key &&
+			p.recordIsOurs(rev.desired, latest.Signature) {
 			p.log.Info("attestation recovered by reconciliation; receipt was lost",
 				"deployment", rev.desired.Label, "tx", prepared.Hash())
 			return p.confirm(id, rev), nil
@@ -356,13 +417,7 @@ func (p *PublisherV2) prepareOnce(ctx context.Context, id [32]byte, rev workload
 
 	sig := rev.signature
 	if sig == nil {
-		env := attest.EnvelopeV2{
-			Version:    rev.desired.Version,
-			Identity:   rev.desired.Identity,
-			UID:        rev.desired.UID,
-			ConfigHash: rev.desired.ConfigHash,
-		}
-		digest, err := env.SigningDigest()
+		digest, err := p.envelopeFor(rev.desired).SigningDigest()
 		if err != nil {
 			return nil, fmt.Errorf("building signing digest: %w", err)
 		}
