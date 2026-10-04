@@ -348,51 +348,72 @@ out of band.
 
 ## Known gaps
 
-Honest inventory of what is missing, roughly in priority order.
+Honest inventory, split by whether the code exists at all. The v2 path is being
+built beside the v1 one and switched over at the end, so "implemented" and "what
+the operator runs" are different questions and this section keeps them apart.
 
-**Protocol**
-- The operator still publishes `v1`, whose surface is too narrow to support a
-  strong "proof of deploy" claim. `v2` exists and verifies, but the operator and
-  chain client are not yet wired to the v2 contract.
-- **There is no cluster identity.** `DeploymentID` is
-  `SHA-256("namespace/name")`, so `payments/api` in two different clusters
-  occupies the same on-chain slot and each overwrites the other. `pod-verify`
-  prints the cluster it read, but that string is local and is bound to nothing
-  in the record.
-- `DeploymentID` carries no incarnation, so a recreated Deployment can match its
-  predecessor's record.
-- `image` is a tag string, not a resolved digest.
+Verify against the code before relying on this list. It has drifted twice.
 
-**Correctness**
-- `PublishAttestation` treats *sent* as *published*: no receipt, no finality, no
-  reorg handling, no nonce management.
-- `internal/chain` validates nothing about the endpoint it talks to — not the
-  chain ID, not the contract's bytecode, not that `publisher()` matches the
-  configured EOA. A malformed address is silently accepted.
-- `internal/signer` validates `KeyUsage` but not `KeySpec`, so a non-P-256 key
-  fails late instead of at startup. `PublicKeyDER()` returns its internal slice
-  uncopied.
-- `Selector.MatchLabels` is not filtered through the generated-label denylist,
-  while pod template labels are.
-- Readiness is `healthz.Ping`: a permanently failing pipeline reports Ready.
-  There are no metrics for queue depth, signing, or publication.
+### What the operator actually runs today
+
+This is the honest answer to "what is the risk right now".
+
+- It publishes **`v1`**, whose surface is too narrow to support a strong "proof
+  of deploy" claim. A privileged workload produces the same hash and the same
+  `PASS`, demonstrated in `config/samples/demo-deployment-tampered.yaml`.
+- It uses the **v1 chain client**, which treats *sent* as *published*: no
+  receipt, no finality, no reorg handling.
+- It performs **no startup validation** of the RPC, chain id or contract.
+- It attests **every Deployment in the cluster**, including its own.
+- Readiness is `healthz.Ping`, so a permanently failing pipeline reports Ready,
+  and there are no metrics for queue depth, signing or publication.
+
+### Built and tested, not yet wired
+
+`go run golang.org/x/tools/cmd/deadcode@latest ./cmd/...` names what no binary
+reaches: 40 functions, all in the five files below.
+
+`NormalizeV2` is the exception and is NOT on that list. `pod-verify` reaches it
+through `ConfigHashForVersion`, so the CLI can already verify a v2 record — it
+simply never encounters one, because nothing publishes them.
+
+- **`WorkloadIdentityV2` and `EnvelopeV2`**: cluster-aware identity with an
+  injective encoding, and a signed envelope binding version, identity,
+  incarnation and config hash.
+- **`AttestationRegistryV2`** and its Go client, with `Prepare`/`Send`/`Wait`,
+  receipt outcomes and retry by resending the same signed transaction.
+- **`PublisherV2`**: the pending/confirmed/retryable state machine, which
+  verifies the on-chain signature before confirming.
+- **Startup validation** of chain id, contract bytecode and `publisher()`.
+
+The KMS signer hardening IS wired: key spec, curve, canonical alias resolution
+and per-signature verification all run in the operator today.
+
+### Not built
+
+- `DeploymentID` carries no incarnation, so under v1 a recreated Deployment can
+  match its predecessor's record. v2's envelope binds one; the switch closes it.
+- `image` is a tag string, not a resolved digest. v2 does not change this — see
+  the ADR for why resolving is a trust-model change, not a fix.
+- Opt-in workload selection, mandatory cluster identity, and the coordinated
+  switch to v2.
+- An end-to-end job in CI. The local path is documented and has been executed,
+  but nothing runs it automatically, so it can rot silently — and the per-package
+  checks do not catch that, since each layer passes on its own.
 - `pod-verify` exits `1` for both a semantic FAIL and an operational error, and
   prints a failure to stdout and stderr both.
 - Hardhat falls back to a live public RPC when `RPC_URL` is unset.
 
-**Testing and tooling**
-- No tests for the publisher, the KMS signer, or the verify CLI. The chain
-  client is covered only by the ABI drift check, not by encode/decode tests.
-- The local end-to-end path is documented and has been executed (see
-  `docs/local-demo.md`), but nothing runs it automatically: there is no e2e job
-  in CI, so it can rot silently.
+v1 filters pod template labels through the generated-label denylist but not
+`Selector.MatchLabels`. In v2 that asymmetry is deliberate and documented —
+controllers inject into the former and not the latter — but v1's was never
+argued, so treat it as unexamined rather than decided.
 
-**Before this is more than a demo**, at minimum: a defensible hash surface,
+**Before this is more than a demo**, at minimum: the v2 switch completed,
 cluster-aware identity, delivery reconciled through receipt and finality,
-documented key rotation, unit and end-to-end tests, observability that notices a
-dead attestor, explicit workload selection, and a published threat model. The
-protocol is versioned and the ABI is automatically verified; the rest is not
-done.
+documented key rotation, an end-to-end test that runs itself, observability that
+notices a dead attestor, explicit workload selection, and a published threat
+model.
 
 `docs/adr/0001-hash-protocol-v2.md` records the accepted design for closing the
 protocol gaps.
