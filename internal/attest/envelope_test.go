@@ -17,6 +17,7 @@ limitations under the License.
 package attest
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -284,7 +285,7 @@ func TestEnvelopeDomainSeparation(t *testing.T) {
 	if dig == env.ConfigHash {
 		t.Error("envelope digest equals the bare config hash")
 	}
-	if dig == SigningDigest(env.Version, env.ConfigHash) {
+	if dig == retiredV1SigningDigest(env.Version, env.ConfigHash) {
 		t.Error("v2 envelope digest collides with the v1 signing digest")
 	}
 	if wid, _ := env.Identity.WorkloadID(); dig == wid {
@@ -293,6 +294,14 @@ func TestEnvelopeDomainSeparation(t *testing.T) {
 	if inc := env.Incarnation(); dig == inc {
 		t.Error("envelope digest collides with the incarnation digest")
 	}
+}
+
+// retiredV1SigningDigest rebuilds the digest v1 signed. v1 is retired, but
+// signatures made under it still exist, possibly by the same key, so a v2
+// envelope must never be able to collide with one.
+func retiredV1SigningDigest(v Version, configHash [32]byte) [32]byte {
+	buf := append([]byte("proof-of-deploy/attestation\x00"), byte(v>>8), byte(v))
+	return sha256.Sum256(append(buf, configHash[:]...))
 }
 
 // TestIncarnation pins the fixed-width UID form, including the sentinel that

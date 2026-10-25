@@ -32,12 +32,6 @@ import (
 // PublisherV2 owns the lifecycle of an attestation from "we observed this" to
 // "the chain holds it".
 //
-// It exists alongside the v1 publisher rather than replacing it. Wiring this to
-// the v1 contract would require weakening what "confirmed" means, because the
-// v1 record has no incarnation and so could never be matched exactly. A
-// deliberately vague confirmation is the exact ambiguity this design removes,
-// so the switch happens with the protocol switch and not before.
-//
 // The state it keeps per workload:
 //
 //	desired    the revision we want on chain, with its signature
@@ -154,9 +148,6 @@ type ChainV2 interface {
 	Send(ctx context.Context, p PreparedTx) (SendOutcome, error)
 	Wait(ctx context.Context, p PreparedTx) (WaitOutcome, error)
 }
-
-// Signer is declared in publisher.go and shared: both publishers need exactly
-// the same slice of the KMS signer.
 
 type workloadState struct {
 	desired Desired

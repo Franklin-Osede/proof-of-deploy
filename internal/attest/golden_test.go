@@ -116,7 +116,6 @@ func TestGoldenVectors(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ConfigHash: %v", err)
 			}
-			gotID := DeploymentID(dep.Namespace, dep.Name)
 
 			// The fixture set is self-checking: a canonical.json and a
 			// hashes.txt that disagree would otherwise both look "golden".
@@ -124,8 +123,7 @@ func TestGoldenVectors(t *testing.T) {
 				t.Fatal("ConfigHash is not SHA-256 of CanonicalJSON; the hash contract is broken")
 			}
 
-			hashesBody := fmt.Sprintf("configHash    %s\ndeploymentID  %s\n",
-				hex.EncodeToString(gotHash[:]), hex.EncodeToString(gotID[:]))
+			hashesBody := fmt.Sprintf("configHash    %s\n", hex.EncodeToString(gotHash[:]))
 
 			jsonPath := filepath.Join("testdata", name, fixtureCanonical)
 			hashPath := filepath.Join("testdata", name, fixtureHashes)
@@ -160,29 +158,6 @@ func TestGoldenVectors(t *testing.T) {
 				t.Errorf("hashes changed -- THIS IS A PROTOCOL CHANGE\n got:\n%swant:\n%s", hashesBody, wantHashes)
 			}
 		})
-	}
-}
-
-// TestDeploymentIDFormat pins the identifier construction independently of any
-// fixture, since it is the on-chain mapping key.
-func TestDeploymentIDFormat(t *testing.T) {
-	got := DeploymentID("payments", "api")
-	want := sha256.Sum256([]byte("payments/api"))
-	if got != want {
-		t.Fatal("DeploymentID is no longer SHA-256(namespace + \"/\" + name)")
-	}
-	// DeploymentID is NOT injective on arbitrary strings: "a" + "/" + "b/c" and
-	// "a/b" + "/" + "c" are the same bytes. It is safe only because Kubernetes
-	// namespaces and names are DNS labels and cannot contain "/".
-	//
-	// That safety therefore rests on an invariant enforced elsewhere, not on
-	// the encoding. Pinned here so that any future change which admits richer
-	// identifiers (a cluster name, a UID, a v2 identity tuple) has to confront
-	// the ambiguity instead of inheriting it.
-	if DeploymentID("a", "b/c") != DeploymentID("a/b", "c") {
-		t.Fatal("DeploymentID is now injective across the separator; if the " +
-			"encoding was made unambiguous on purpose, update this test and " +
-			"the identity notes in the README")
 	}
 }
 
@@ -261,7 +236,7 @@ func TestSignatureVector(t *testing.T) {
 	sigPath := filepath.Join(signatureFixtureDir, "signature.der")
 	fpPath := filepath.Join(signatureFixtureDir, "fingerprint.txt")
 
-	// What is signed is the version-bound digest, not the bare config hash.
+	// What is signed is the v2 envelope digest, not the bare config hash.
 	digest := attestSigningDigest(t, "01-baseline")
 
 	if *update {
@@ -301,14 +276,18 @@ func TestSignatureVector(t *testing.T) {
 	}
 
 	// The signature must NOT verify over the bare config hash. If it did, the
-	// version binding would be decorative and a relabelled record would still
-	// verify.
-	if VerifyConfigHashSignature(pub, fixtureHash(t, "01-baseline"), sig) {
-		t.Fatal("signature verifies over the bare config hash; the version is not actually bound")
+	// envelope would be decorative and a record with its identity, incarnation
+	// or version swapped would still verify.
+	if VerifyConfigHashSignature(pub, fixtureHashV2(t, "01-baseline"), sig) {
+		t.Fatal("signature verifies over the bare config hash; the envelope is not actually bound")
 	}
 
 	// Nor under a different protocol version.
-	if VerifyConfigHashSignature(pub, SigningDigest(V1+1, fixtureHash(t, "01-baseline")), sig) {
+	relabelled := signatureEnvelope(t, "01-baseline")
+	relabelled.Version = V1
+	if d, err := relabelled.SigningDigest(); err != nil {
+		t.Fatalf("digest: %v", err)
+	} else if VerifyConfigHashSignature(pub, d, sig) {
 		t.Fatal("signature verifies under a different protocol version")
 	}
 
@@ -385,12 +364,30 @@ func mustWrite(t *testing.T, path string, b []byte) {
 	}
 }
 
-// attestSigningDigest is the v1 signing digest for a fixture: the v1 config
-// hash bound to V1. It pins the v1 scheme, so it names V1 rather than
-// following CurrentVersion.
+// signatureEnvelope is the envelope the signature fixture is taken over: the
+// fixture's v2 config hash under a fixed identity and UID.
+func signatureEnvelope(t *testing.T, name string) EnvelopeV2 {
+	t.Helper()
+	dep := loadFixture(t, name)
+	return EnvelopeV2{
+		Version: V2,
+		Identity: WorkloadIdentityV2{
+			ClusterID: "golden-cluster", APIVersion: "apps/v1", Kind: "Deployment",
+			Namespace: dep.Namespace, Name: dep.Name,
+		},
+		UID:        "00000000-0000-0000-0000-000000000001",
+		ConfigHash: fixtureHashV2(t, name),
+	}
+}
+
+// attestSigningDigest is the digest actually signed for a fixture.
 func attestSigningDigest(t *testing.T, name string) [32]byte {
 	t.Helper()
-	return SigningDigest(V1, fixtureHash(t, name))
+	d, err := signatureEnvelope(t, name).SigningDigest()
+	if err != nil {
+		t.Fatalf("%s: signing digest: %v", name, err)
+	}
+	return d
 }
 
 // TestVersionDispatch pins that an unimplemented version is a hard error rather
@@ -444,27 +441,6 @@ func TestVersionDispatch(t *testing.T) {
 	// carry no other hash surface.
 	if CurrentVersion != V2 {
 		t.Errorf("CurrentVersion is %v; the operator publishes v2 envelopes, which must carry v2 hashes", CurrentVersion)
-	}
-}
-
-// TestSigningDigestBinding pins that the signed bytes are domain-separated and
-// version-bound, so a signature cannot be replayed across versions or confused
-// with some other use of the same key.
-func TestSigningDigestBinding(t *testing.T) {
-	h := fixtureHash(t, "01-baseline")
-	other := fixtureHash(t, "02-minimal-defaults")
-
-	if SigningDigest(V1, h) == h {
-		t.Error("signing digest equals the raw config hash; there is no binding")
-	}
-	if SigningDigest(V1, h) == SigningDigest(V1+1, h) {
-		t.Error("same digest across protocol versions; the version is not bound")
-	}
-	if SigningDigest(V1, h) == SigningDigest(V1, other) {
-		t.Error("same digest for different config hashes")
-	}
-	if SigningDigest(V1, h) != SigningDigest(V1, h) {
-		t.Error("signing digest is not deterministic")
 	}
 }
 
