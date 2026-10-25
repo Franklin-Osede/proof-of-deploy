@@ -1,4 +1,4 @@
-// Deploys AttestationRegistry to the configured network.
+// Deploys AttestationRegistryV2 to the configured network.
 //
 // The deployer account (PRIVATE_KEY) becomes the immutable `publisher`. This is
 // the SAME testnet wallet the operator uses as ETH_PRIVATE_KEY to publish
@@ -19,13 +19,13 @@ async function main() {
   console.log(`Deployer:  ${deployer.address}`);
   console.log(`Balance:   ${ethers.formatEther(balance)} (testnet)`);
 
-  const Factory = await ethers.getContractFactory("AttestationRegistry");
+  const Factory = await ethers.getContractFactory("AttestationRegistryV2");
   const reg = await Factory.deploy(deployer.address);
   await reg.waitForDeployment();
 
   const addr = await reg.getAddress();
   console.log("");
-  console.log("AttestationRegistry deployed.");
+  console.log("AttestationRegistryV2 deployed.");
   console.log(`  address:   ${addr}`);
   console.log(`  publisher: ${deployer.address}`);
   console.log("");

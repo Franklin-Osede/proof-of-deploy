@@ -56,12 +56,9 @@ const (
 	// docs/adr/0001-hash-protocol-v2.md.
 	V2 Version = 2
 
-	// CurrentVersion is what the operator publishes.
-	//
-	// Still V1: NormalizeV2 exists and v2 records can be verified, but the
-	// operator and chain client are not yet wired to the v2 contract. Flipping
-	// this before that would publish v2 hashes into a v1 registry.
-	CurrentVersion = V1
+	// CurrentVersion is what the operator publishes. It only ever travels in
+	// a v2 envelope to the v2 registry.
+	CurrentVersion = V2
 )
 
 // ErrUnknownVersion is returned when asked to work with a protocol version this

@@ -76,10 +76,14 @@ export ETH_RPC_URL=http://127.0.0.1:8545
 export CONTRACT_ADDRESS=<from step 2>
 export ETH_PRIVATE_KEY=<account #0 key printed by `npx hardhat node`>
 export CHAIN_ID=31337
+export CLUSTER_ID=local-demo
 go run ./cmd
 ```
 
-Watch for `attestation published` with a tx hash.
+Startup first logs `chain validated`: the operator has checked the chain id, that
+the address runs the expected registry bytecode, and that the registry's
+publisher is the account it holds the key for. Then watch for
+`attestation published` with a tx hash.
 
 The operator watches the **whole cluster**, so it will also attest `coredns` and
 `local-path-provisioner`. That is current behaviour, not a bug in the demo — see
@@ -93,61 +97,82 @@ go build -o bin/pod-verify ./cmd/verify
   --namespace demo --name api \
   --eth-rpc-url http://127.0.0.1:8545 \
   --contract-address <from step 2> \
+  --chain-id 31337 \
+  --cluster-id local-demo \
   --kms-key-id "$KMS_KEY_ID"
 ```
+
+`--cluster-id` must be the value the operator was given: it is part of the
+workload ID, so a different value looks up a different record.
 
 Expected:
 
 ```
 PASS  demo/api
   cluster:            kind-proof-of-deploy (https://127.0.0.1:PORT)
-  hash protocol:      v1
-  config hash:        89ab57526b689c52761431af4bc5451933c1947b74e0db262438ad1881c17a77
+  cluster id:         local-demo
+  uid:                <the Deployment's UID>
+  hash protocol:      v2
+  config hash:        <64 hex digits>
   signer fingerprint: <depends on the key you created in step 1>
   ...
-
-  WARNING: v1 hashes a narrow subset of the Deployment. ...
 ```
 
-The warning is not incidental. It is printed on every v1 `PASS` precisely
-because of what step 6 below demonstrates.
-
-The config hash is fixed by the manifest and is pinned as a golden vector
-(`internal/attest/testdata/08-v1-weakness-benign`), so it should match exactly.
 The fingerprint is whatever LocalStack minted for you and differs every run.
+
+Exit codes: `0` PASS, `1` FAIL, `2` the verifier could not reach an answer
+(unreachable RPC, wrong contract, missing flags).
 
 > On a machine with several clusters, pass `--context kind-proof-of-deploy`.
 > Without it the CLI follows whatever context is currently active. The PASS
 > output names the cluster it actually read, so check that line.
 
-## 6. The two demonstrations
+## 6. The demonstrations
 
-### A change that IS detected
+Stop the operator before each one, so it does not re-attest the change you are
+about to detect.
+
+### A changed image
 
 ```sh
 kubectl -n demo set image deploy/api server=registry.k8s.io/pause:3.10
 # rerun pod-verify -> FAIL, config hash mismatch
 ```
 
-### A change that is NOT detected
-
-Stop the operator first, so it does not re-attest, then:
+### A privilege escalation that keeps the same image
 
 ```sh
 kubectl apply -f config/samples/demo-deployment-tampered.yaml
 kubectl -n demo rollout status deploy/api
-# rerun pod-verify -> PASS
+# rerun pod-verify -> FAIL, config hash mismatch
 ```
 
-The workload is now running privileged, as root, with `hostPID`, with the host
+The tampered manifest runs privileged, as root, with `hostPID`, with the host
 root filesystem mounted at `/host`, under a different ServiceAccount, executing
-a different command, with an extra init container — and it produces the **same
-config hash** and the same `PASS`.
+a different command, with an extra init container -- and the same image. v1
+hashed it identically to the benign one and printed `PASS`; v2 covers those
+fields, so it fails. The golden vectors
+`internal/attest/testdata/08-v1-weakness-benign` and `09-v1-weakness-tampered`
+pin both hashes.
 
-That is the point of the exercise. `PASS` speaks only about the fields listed in
-README "What fields are excluded and why". Until the hash surface is widened
-under an explicit protocol version, it is not evidence about privilege or
-behaviour.
+### Delete and recreate
+
+```sh
+kubectl apply -f config/samples/demo-deployment.yaml   # back to the benign spec
+# start the operator, wait for `attestation published`, stop it again
+kubectl -n demo delete deploy/api
+kubectl apply -f config/samples/demo-deployment.yaml
+# rerun pod-verify -> FAIL, incarnation mismatch
+```
+
+The spec is identical, so the config hash matches. The new object has a new
+UID, and the record was signed for the old one.
+
+### What v2 still does not see
+
+Literal environment values, the contents of referenced ConfigMaps and Secrets,
+what the ServiceAccount is allowed to do, and what a mutable image tag points
+at. See README "What fields are excluded and why".
 
 ## Running the operator inside the cluster
 
@@ -163,7 +188,8 @@ kubectl -n proof-of-deploy-system create secret generic proof-of-deploy-config \
   --from-literal=ETH_RPC_URL=... \
   --from-literal=CONTRACT_ADDRESS=... \
   --from-literal=ETH_PRIVATE_KEY=... \
-  --from-literal=CHAIN_ID=...
+  --from-literal=CHAIN_ID=... \
+  --from-literal=CLUSTER_ID=...
 kubectl apply -k config/kind
 ```
 

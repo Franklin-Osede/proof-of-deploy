@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,7 +33,7 @@ import (
 // AttestationEnqueuer is the publisher seam. The reconciler only ever enqueues;
 // it never waits for signing or chain I/O.
 type AttestationEnqueuer interface {
-	Enqueue(job publisher.Job)
+	Enqueue(d publisher.Desired) error
 }
 
 // DeploymentReconciler observes apps/v1 Deployments and, when a rollout has
@@ -42,23 +41,19 @@ type AttestationEnqueuer interface {
 // normalized configuration. It has only read RBAC on Deployments and never
 // mutates them: the operator is a passive observer and cannot block, delay, or
 // alter a deployment.
+//
+// It keeps no record of what it has enqueued. Whether a revision still needs
+// publishing is the publisher's question, answered against what it has
+// confirmed on chain; a second opinion here could only disagree with it.
+// Enqueueing an unchanged revision is a lock and a map lookup.
 type DeploymentReconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
 	Publisher AttestationEnqueuer
 
-	// lastAttested deduplicates by remembering the most recently attested
-	// config hash per Deployment ID. It is an in-memory optimization: on
-	// operator restart it is empty, so the next converged observation may
-	// re-publish one identical attestation, costing one extra testnet
-	// transaction.
-	//
-	// Entries are dropped when a Deployment is observed to be gone, so a later
-	// recreation under the same namespace/name is attested as the new
-	// incarnation it is instead of being masked by the previous one's record.
-	// See README "Failure modes" for the window this still leaves open.
-	mu           sync.Mutex
-	lastAttested map[[32]byte][32]byte
+	// ClusterID is this cluster's stable identity, part of every workload ID.
+	// It is configured, never derived, and must not be empty.
+	ClusterID string
 }
 
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
@@ -77,17 +72,12 @@ type DeploymentReconciler struct {
 func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	id := attest.DeploymentID(req.Namespace, req.Name)
-
 	var dep appsv1.Deployment
 	if err := r.Get(ctx, req.NamespacedName, &dep); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Deleted. Nothing to attest — the contract has no tombstone — but
-			// the dedup entry must go. DeploymentID is SHA-256("namespace/name")
-			// and carries no UID, so a recreation reuses this exact key; keeping
-			// the entry would make us skip the new incarnation and leave it
-			// covered only by the previous incarnation's on-chain record.
-			r.forgetAttested(id)
+			// Deleted. Nothing to attest: the contract has no tombstone. A
+			// recreation needs no special handling either, because it has a
+			// new UID and therefore a new incarnation.
 			return ctrl.Result{}, nil
 		}
 		log.Error(err, "failed to read deployment; will retry")
@@ -110,47 +100,31 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	if r.alreadyAttested(id, configHash) {
+	d := publisher.Desired{
+		Identity: attest.WorkloadIdentityV2{
+			ClusterID:  r.ClusterID,
+			APIVersion: "apps/v1",
+			Kind:       "Deployment",
+			Namespace:  dep.Namespace,
+			Name:       dep.Name,
+		},
+		Version:    attest.CurrentVersion,
+		ConfigHash: configHash,
+		UID:        string(dep.UID),
+		Label:      req.NamespacedName.String(),
+	}
+	if err := r.Publisher.Enqueue(d); err != nil {
+		// Only an invalid identity fails here, which is a configuration fault
+		// that retrying cannot fix.
+		log.Error(err, "failed to enqueue attestation", "deployment", d.Label)
 		return ctrl.Result{}, nil
 	}
-
-	// Optimistically record before enqueue so a burst of identical reconciles
-	// does not enqueue duplicates. The work queue also coalesces identical
-	// Jobs, and the publisher retries until success, so this is safe.
-	r.recordAttested(id, configHash)
-	r.Publisher.Enqueue(publisher.Job{
-		DeploymentID:   id,
-		Version:        attest.CurrentVersion,
-		ConfigHash:     configHash,
-		NamespacedName: req.NamespacedName.String(),
-	})
-	log.Info("enqueued attestation for converged deployment",
-		"deployment", req.NamespacedName.String(),
+	log.V(1).Info("converged deployment handed to publisher",
+		"deployment", d.Label,
 		"hashVersion", attest.CurrentVersion.String(),
 		"configHash", attest.MustHex(configHash),
 	)
 	return ctrl.Result{}, nil
-}
-
-func (r *DeploymentReconciler) alreadyAttested(id, hash [32]byte) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	prev, ok := r.lastAttested[id]
-	return ok && prev == hash
-}
-
-func (r *DeploymentReconciler) recordAttested(id, hash [32]byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.lastAttested[id] = hash
-}
-
-// forgetAttested drops the dedup entry for a Deployment that no longer exists,
-// so a recreation under the same namespace/name is attested afresh.
-func (r *DeploymentReconciler) forgetAttested(id [32]byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.lastAttested, id)
 }
 
 // rolloutConverged reports whether a Deployment has reached a stable applied
@@ -178,9 +152,6 @@ func rolloutConverged(d *appsv1.Deployment) bool {
 // do not bump generation, so we must see status events too. Reconcile is cheap
 // and idempotent, so the extra wakeups are immaterial.
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.lastAttested == nil {
-		r.lastAttested = make(map[[32]byte][32]byte)
-	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1.Deployment{}).
 		Named("deployment-attestor").

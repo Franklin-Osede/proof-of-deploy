@@ -7,9 +7,14 @@
 #   kubectl -n proof-of-deploy-system create secret generic proof-of-deploy-config \
 #     --from-literal=KMS_KEY_ID=<key id, ARN or alias> \
 #     --from-literal=ETH_RPC_URL=<testnet JSON-RPC endpoint> \
-#     --from-literal=CONTRACT_ADDRESS=<deployed AttestationRegistry> \
+#     --from-literal=CONTRACT_ADDRESS=<deployed AttestationRegistryV2> \
 #     --from-literal=ETH_PRIVATE_KEY=<throwaway TESTNET key> \
-#     --from-literal=CHAIN_ID=<evm chain id>
+#     --from-literal=CHAIN_ID=<evm chain id> \
+#     --from-literal=CLUSTER_ID=<stable name for this cluster>
+#
+# CLUSTER_ID is part of every workload ID. Choose it once and never change it:
+# a new value makes every existing attestation unreachable under the new IDs.
+# Do not reuse the kubeconfig context name, which is local and mutable.
 #
 # ETH_PRIVATE_KEY is a gas-paying key for a DISPOSABLE testnet wallet. It is not
 # an attestation key — attestations are signed inside KMS and that private key
@@ -29,3 +34,4 @@ stringData:
   CONTRACT_ADDRESS: REPLACE_ME
   ETH_PRIVATE_KEY: REPLACE_ME
   CHAIN_ID: REPLACE_ME
+  CLUSTER_ID: REPLACE_ME

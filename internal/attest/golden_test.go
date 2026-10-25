@@ -385,11 +385,12 @@ func mustWrite(t *testing.T, path string, b []byte) {
 	}
 }
 
-// attestSigningDigest is the digest actually signed for a fixture: the config
-// hash bound to the current protocol version.
+// attestSigningDigest is the v1 signing digest for a fixture: the v1 config
+// hash bound to V1. It pins the v1 scheme, so it names V1 rather than
+// following CurrentVersion.
 func attestSigningDigest(t *testing.T, name string) [32]byte {
 	t.Helper()
-	return SigningDigest(CurrentVersion, fixtureHash(t, name))
+	return SigningDigest(V1, fixtureHash(t, name))
 }
 
 // TestVersionDispatch pins that an unimplemented version is a hard error rather
@@ -439,11 +440,10 @@ func TestVersionDispatch(t *testing.T) {
 	if VersionUnknown.String() != "unknown" || V1.String() != "v1" || V2.String() != "v2" {
 		t.Errorf("version rendering changed: %q, %q, %q", VersionUnknown, V1, V2)
 	}
-	// The operator still publishes v1 until the chain client is wired to the
-	// v2 contract; flipping CurrentVersion before that would write v2 hashes
-	// into a v1 registry.
-	if CurrentVersion != V1 {
-		t.Log("CurrentVersion moved off v1 -- confirm the operator and chain client target the v2 contract")
+	// The operator publishes only through the v2 envelope and registry, which
+	// carry no other hash surface.
+	if CurrentVersion != V2 {
+		t.Errorf("CurrentVersion is %v; the operator publishes v2 envelopes, which must carry v2 hashes", CurrentVersion)
 	}
 }
 
