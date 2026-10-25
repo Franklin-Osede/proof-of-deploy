@@ -42,6 +42,9 @@ type fakeSigner struct {
 	der   []byte
 	calls int
 	err   error
+	// onSign runs before signing, which is how a revision arriving while KMS
+	// is being called is expressed.
+	onSign func()
 }
 
 func newFakeSigner(t *testing.T) *fakeSigner {
@@ -60,6 +63,9 @@ func newFakeSigner(t *testing.T) *fakeSigner {
 func (f *fakeSigner) PublicKeyDER() []byte { return f.der }
 func (f *fakeSigner) SignDigest(_ context.Context, d [32]byte) ([]byte, error) {
 	f.calls++
+	if f.onSign != nil {
+		f.onSign()
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -408,6 +414,126 @@ func TestNewRevisionSupersedesAnOldInFlightOne(t *testing.T) {
 	}
 	if c.prepares != preparesBefore {
 		t.Error("a confirmed workload was published again")
+	}
+}
+
+// --- rollback and supersession ---------------------------------------------
+//
+// "Already confirmed" describes the chain at the moment it was observed. Once a
+// different revision has been desired, something may have been sent for it, so
+// a confirmation from before that point no longer says what the chain holds.
+
+// TestRollbackBeforeTheNewRevisionIsSent: A is confirmed, B is desired, and
+// the Deployment returns to A before B is worked. B must not be published.
+func TestRollbackBeforeTheNewRevisionIsSent(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	revA := desired("api", 0x11, "uid-1")
+	revB := desired("api", 0x22, "uid-1")
+	id := mustID(t, revA)
+
+	_ = p.Enqueue(revA)
+	if _, err := p.process(context.Background(), id); err != nil {
+		t.Fatalf("process A: %v", err)
+	}
+	// The chain holds A, as it would after a mined publish.
+	c.setRecord(p.revisionKey(revA), s.sign(t, p, revA))
+
+	_ = p.Enqueue(revB)
+	_ = p.Enqueue(revA)
+
+	preparesBefore, signsBefore := c.prepares, s.calls
+	if _, err := p.process(context.Background(), id); err != nil {
+		t.Fatalf("process after rollback: %v", err)
+	}
+	if c.prepares != preparesBefore || s.calls != signsBefore {
+		t.Errorf("published after rolling back to the state already on chain: prepares %d->%d signs %d->%d",
+			preparesBefore, c.prepares, signsBefore, s.calls)
+	}
+
+	p.mu.Lock()
+	haveKey := p.state[id].key
+	p.mu.Unlock()
+	if haveKey != p.revisionKey(revA) {
+		t.Error("the rollback to A was dropped; B is still desired")
+	}
+}
+
+// TestRollbackAfterTheNewRevisionLanded: A is confirmed, B is sent with an
+// unknown outcome and later mines, then the Deployment returns to A. The chain
+// now holds B, so A must be published again.
+func TestRollbackAfterTheNewRevisionLanded(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	revA := desired("api", 0x11, "uid-1")
+	revB := desired("api", 0x22, "uid-1")
+	id := mustID(t, revA)
+
+	_ = p.Enqueue(revA)
+	if _, err := p.process(context.Background(), id); err != nil {
+		t.Fatalf("process A: %v", err)
+	}
+
+	_ = p.Enqueue(revB)
+	c.waitOut = WaitUnknown
+	if _, err := p.process(context.Background(), id); err == nil {
+		t.Fatal("unknown must not report success")
+	}
+	// B mines after its worker gave up waiting.
+	c.setRecord(p.revisionKey(revB), s.sign(t, p, revB))
+	c.waitOut = WaitMinedSuccess
+
+	_ = p.Enqueue(revA)
+	preparesBefore := c.prepares
+	if _, err := p.process(context.Background(), id); err != nil {
+		t.Fatalf("process after rollback: %v", err)
+	}
+	if c.prepares != preparesBefore+1 {
+		t.Fatalf("A was not republished over B: prepares %d -> %d", preparesBefore, c.prepares)
+	}
+
+	p.mu.Lock()
+	confirmed := p.state[id].confirmed
+	p.mu.Unlock()
+	if confirmed == nil || *confirmed != p.revisionKey(revA) {
+		t.Errorf("confirmed %v, want A", confirmed)
+	}
+}
+
+// TestRevisionArrivingDuringSigningIsNotSent: B is desired while A is being
+// signed. A's transaction must never be sent, because once sent it cannot be
+// taken back.
+func TestRevisionArrivingDuringSigningIsNotSent(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	revA := desired("api", 0x11, "uid-1")
+	revB := desired("api", 0x22, "uid-1")
+	id := mustID(t, revA)
+	_ = p.Enqueue(revA)
+
+	s.onSign = func() {
+		s.onSign = nil
+		_ = p.Enqueue(revB)
+	}
+	again, err := p.process(context.Background(), id)
+	if err != nil {
+		t.Fatalf("process A: %v", err)
+	}
+	if c.sends != 0 {
+		t.Fatalf("sent A after it was superseded: sends=%d", c.sends)
+	}
+	if !again {
+		t.Fatal("A was superseded, but the publisher did not report more work")
+	}
+
+	if _, err := p.process(context.Background(), id); err != nil {
+		t.Fatalf("process B: %v", err)
+	}
+	if c.sends != 1 {
+		t.Fatalf("sends=%d, want exactly B's", c.sends)
+	}
+	p.mu.Lock()
+	confirmed := p.state[id].confirmed
+	p.mu.Unlock()
+	if confirmed == nil || *confirmed != p.revisionKey(revB) {
+		t.Errorf("confirmed %v, want B", confirmed)
 	}
 }
 
