@@ -10,24 +10,29 @@ The Ethereum key it uses (`ETH_PRIVATE_KEY`) pays gas and is expected to be a
 disposable testnet wallet. It is **not** an attestation key: attestations are
 signed inside AWS KMS and that private key never leaves KMS.
 
+The operator publishes, and `pod-verify` accepts, **hash protocol v2 only**.
+v1 is retired; its normalizer is kept in the repository as a pinned example of
+a weak hash surface, not as a supported path.
+
 ## Already known — please do not report these
 
 These are documented design limitations, not undisclosed vulnerabilities:
 
-- **The v1 hash surface does not cover privilege.** A workload can be made
-  privileged, run as root, given host namespaces and the host filesystem, and
-  handed a different ServiceAccount while producing an identical hash and a
-  `PASS`. This is demonstrated deliberately in
-  `config/samples/demo-deployment-tampered.yaml` and reproduced in
-  `docs/local-demo.md`. Protocol v2 addresses it and is not yet wired to the
-  operator.
-- **No cluster identity.** `DeploymentID` is `SHA-256("namespace/name")`, so the
-  same workload name in two clusters sharing a registry collides.
-- **A sent transaction is treated as published.** No receipt, no finality, no
-  reorg handling.
-- **The operator attests every Deployment in the cluster**, including its own.
-- `image` is hashed as a string, not a resolved digest, so a moved tag changes
-  the running bytes without changing the hash.
+- **Literal environment variable values are not hashed.** Kubernetes expands
+  `$(VAR)` references into `command` and `args`, so changing a literal value
+  can change what runs without changing the hash. Contents of referenced
+  ConfigMaps and Secrets are not hashed either.
+- **`image` is hashed as a string**, not a resolved digest, so a moved tag
+  changes the running bytes without changing the hash.
+- **No freshness or ordering.** Whoever controls the publisher account can
+  re-post an older, validly signed record for the same Deployment incarnation.
+- **No confirmation depth.** A record counts once its transaction is mined; a
+  reorg can remove it.
+- **The operator attests every Deployment in the cluster**, and a failing
+  pipeline is not reflected in readiness.
+- **The apiserver, nodes, admission webhooks and the operator itself are
+  trusted.** A `PASS` is a statement about the object the apiserver served, not
+  about what executes.
 
 The `Known gaps` section of the README is the full inventory.
 
@@ -44,7 +49,7 @@ research project.
 ## What would count
 
 Something that breaks a claim the project actually makes: a way to make
-`pod-verify` report `PASS` for a Deployment whose attested fields differ from
-the signed record, a flaw in the canonical encoding that lets two distinct
-inputs collide, or a way to forge a valid signature or on-chain record without
-the KMS key or the publisher account.
+`pod-verify` report `PASS` when a hashed v2 field, the UID, or the workload
+identity differs from the signed record; a flaw in the canonical encoding that
+lets two distinct inputs collide; or a way to forge a valid signature or
+on-chain record without the KMS key or the publisher account.

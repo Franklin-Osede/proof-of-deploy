@@ -1,16 +1,17 @@
-# DEMO ONLY — the point of this file is to FAIL to be detected.
+# DEMO ONLY — a privilege escalation that keeps the same image.
 #
-# Every field that participates in the config hash is byte-identical to
-# demo-deployment.yaml: same namespace, name, labels, replicas, selector, pod
-# template labels, container name, image, env NAMES, and resources.
+# Under the retired hash protocol v1 this file was undetectable: every field v1
+# hashed is byte-identical to demo-deployment.yaml (namespace, name, labels,
+# replicas, selector, pod template labels, container name, image, env NAMES,
+# and resources), so it produced the same config hash and pod-verify said PASS.
 #
-# Everything that differs is outside the attested surface, so this Deployment
-# produces the SAME config hash and pod-verify reports PASS — while running a
-# different command, as root, privileged, with the host filesystem mounted, and
-# under a different ServiceAccount.
+# Under v2, which the operator now publishes, it hashes DIFFERENTLY and
+# pod-verify reports FAIL: v2 covers the command, init containers, security
+# context, host namespaces, volumes and ServiceAccount changed below. The
+# "NOT hashed" notes on individual fields describe v1.
 #
-# This is the concrete demonstration of README "What fields are excluded and
-# why". Do not treat a PASS as evidence about any of these fields.
+# The changed LOG_LEVEL value is still invisible under v2: literal env values
+# are not hashed. See README "What PASS means".
 apiVersion: v1
 kind: ServiceAccount
 metadata:

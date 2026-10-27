@@ -7,10 +7,11 @@ KMS key, and records the signature on a public EVM testnet. A companion CLI
 it against the on-chain record.
 
 > **Status: testnet demonstration.** Not production software. Never point it at
-> mainnet, and never fund the Ethereum account it uses with real value. See
-> [Known gaps](#known-gaps) for what is missing, [CHANGELOG.md](CHANGELOG.md)
-> for exactly what a `PASS` means, and [SECURITY.md](SECURITY.md) before
-> reporting anything.
+> mainnet, and never fund the Ethereum account it uses with real value. The
+> operator publishes and the verifier accepts **hash protocol v2 only**. See
+> [What PASS means](#what-pass-means) for exactly what a `PASS` claims,
+> [Known gaps](#known-gaps) for what is missing, and [SECURITY.md](SECURITY.md)
+> before reporting anything.
 
 ---
 
@@ -18,28 +19,36 @@ it against the on-chain record.
 
 ```
 Kubernetes apiserver
-  │  watch (cluster-wide, get/list/watch only — no write verbs anywhere)
+  │  watch (cluster-wide; Deployments are get/list/watch only)
   ▼
 DeploymentReconciler.Reconcile
   │  attest only once the rollout has converged
   ▼
-attest.Normalize  →  attest.ConfigHash = SHA-256(canonical JSON)
-  │
+attest.NormalizeV2  →  configHash = SHA-256(canonical JSON)
+  │  workload identity = (CLUSTER_ID, apps/v1, Deployment, namespace, name)
   ▼
-Publisher.Enqueue         (in-memory queue; reconcile returns immediately)
+PublisherV2.Enqueue       (in-memory; reconcile returns immediately)
   │
-  ├─ AWS KMS SignDigest   (ECC_NIST_P256 / ECDSA_SHA_256 / MessageType=DIGEST)
-  └─ chain.PublishAttestation   (EOA pays testnet gas)
+  ├─ read the chain first: already published and signature verifies? → done
+  ├─ AWS KMS sign the v2 envelope digest
+  │     SHA-256(domain ‖ version ‖ identity ‖ UID ‖ configHash), MessageType=DIGEST
+  └─ prepare once → send → wait for the receipt (EOA pays testnet gas)
        ▼
-AttestationRegistry.latest[deploymentId]
-       │  configHash, DER signature, signer fingerprint, block timestamp
+AttestationRegistryV2.latest[workloadId]
+       │  configHash, incarnation, signature, signer fingerprint, hash version
        ▼
-pod-verify  →  PASS / FAIL
+pod-verify  →  PASS (exit 0) / FAIL (exit 1) / could not decide (exit 2)
 ```
 
-The reconciler never blocks on signing or chain I/O. It holds a read-only
-ClusterRole and cannot mutate, delay, or back-pressure any Deployment. That is
-the project's one hard invariant.
+The reconciler never blocks on signing or chain I/O. It has read-only access to
+Deployments and cannot mutate, delay, or back-pressure any of them. That is the
+project's one hard invariant. (Leader election does write a Lease and Events in
+the operator's own namespace.)
+
+Startup refuses to run unless the RPC reports the configured chain id, the
+address holds exactly the expected registry bytecode, the registry's publisher
+is the account the operator holds the key for, and the KMS key is a P-256
+signing key.
 
 `internal/attest` is the single source of truth for normalization, hashing, and
 verification. Both the operator and the CLI import it. Forking that logic breaks
@@ -49,92 +58,95 @@ the protocol.
 
 ## What PASS means
 
-A `PASS` from `pod-verify` asserts exactly three things:
+In one sentence: **the selected configuration fields of the live Deployment
+match a signed observation of the same Deployment incarnation.**
 
-1. The Deployment read from the apiserver **right now** normalizes and hashes to
-   the same value recorded on-chain.
-2. The signer fingerprint on-chain matches SHA-256 of the DER public key **you
-   supplied to the verifier**.
-3. That key's ECDSA signature over the config hash is valid.
+Concretely, a `PASS` from `pod-verify` asserts:
+
+1. The Deployment read from the apiserver **right now** hashes, under protocol
+   v2, to the value in the registry's latest record for this cluster ID and
+   namespace/name.
+2. The live object has the **same UID** as the one that was signed, so a
+   deleted-and-recreated Deployment does not inherit its predecessor's record.
+3. The record's signer fingerprint matches the public key **you supplied to the
+   verifier**, and that key's signature over the v2 envelope (version, cluster
+   ID, kind, namespace, name, UID, config hash) is valid.
+4. The contract address runs the expected registry bytecode, on an RPC that
+   reports the configured chain id.
+
+A `FAIL` means "not currently attested". That includes tampering, and also a
+legitimate change whose rollout has not converged or whose transaction has not
+mined yet.
 
 ### What PASS does **not** mean
 
+- It does not prove the selected fields are everything that matters. **Literal
+  environment variable values are not hashed**, and Kubernetes expands `$(VAR)`
+  references into `command` and `args`, so changing a literal value can change
+  the program that runs without changing the hash. The contents of referenced
+  ConfigMaps and Secrets are not hashed either.
 - It does not prove the running containers execute the image bytes the
   Deployment names. `image` is hashed as a **string**, not a resolved digest —
   `repo/app:latest` can point at different bytes tomorrow with no hash change.
-- It does not prove the apiserver's view matches what the nodes actually run.
+- It does not prove the apiserver's view matches what the nodes actually run,
+  or what mutating admission webhooks added to the Pods.
 - It does not prove the cluster, kubelet, registry, or operator was honest when
   the attestation was produced.
 - It does not prove KMS only ever signed authorized states.
-- It does not prove the excluded fields match. **Two workloads with materially
-  different behavior and privileges can share a config hash** — see the next
-  section.
-- It carries no freshness bound. The verifier does not check how old the
-  attestation is.
+- It carries no freshness or ordering bound. The verifier does not check how old
+  the record is, and whoever holds the publisher account can re-post an older,
+  validly signed record.
+- The record is accepted once mined. There is no confirmation depth, so a reorg
+  can still remove it.
 
 ---
 
-## What fields are excluded and why
+## What is hashed (protocol v2)
 
-This is the section the code has been pointing at, and it is the most important
-limitation in the project.
+v2 answers *"does this workload execute, and is it permitted to do, what was
+attested?"* for the fields it covers. A field is in scope when it changes what a
+converged Pod can do (code, arguments, credentials, isolation, resource access,
+name resolution) or where it may be placed. The full reasoning is in
+`docs/adr/0001-hash-protocol-v2.md`; the code is `internal/attest/normalize_v2.go`.
 
-### What IS hashed
+**Hashed**, for both `containers` and `initContainers`, in declared order:
+name, image (as a string), command, args, workingDir, env var **names** and
+their `valueFrom` sources, `envFrom` sources, ports, imagePullPolicy, resources,
+volumeMounts, volumeDevices, securityContext, probes, lifecycle hooks, and the
+container-level restartPolicy that makes an init container a sidecar.
 
-| Field | Notes |
-|---|---|
-| `metadata.namespace`, `metadata.name` | also the identity |
-| `metadata.labels` | minus the generated denylist below |
-| `spec.replicas` | `nil` normalized to `1` |
-| `spec.selector` | `matchLabels` and sorted `matchExpressions` |
-| `spec.template.metadata.labels` | minus the generated denylist |
-| container `name`, `image` | image as a **string**, not a digest |
-| container env **names** | values are never read |
-| container `resources.requests` / `.limits` | canonical `Quantity` strings |
+At pod level: serviceAccountName, automountServiceAccountToken,
+imagePullSecrets, hostNetwork/hostPID/hostIPC/hostUsers, runtimeClassName, pod
+securityContext, shareProcessNamespace, volumes, resourceClaims, hostAliases,
+DNS policy and config, hostname/subdomain, enableServiceLinks, and placement
+(nodeSelector, nodeName, schedulerName, affinity, tolerations, topology spread,
+priority class, preemption policy, scheduling gates, OS). Plus namespace, name,
+Deployment labels, selector and pod template labels.
 
-Only `spec.template.spec.containers` is read. Labels excluded as
-controller-generated: `pod-template-hash`, `controller-revision-hash`,
-`pod-template-generation`, `statefulset.kubernetes.io/pod-name`,
-`apps.kubernetes.io/pod-index`, `batch.kubernetes.io/job-completion-index`.
+`TestV2SurfaceAccountsForEveryField` fails when an upstream `PodSpec` or
+`Container` field is neither hashed nor excluded with a stated reason.
 
-### What is NOT hashed
+**Not hashed, by decision:**
+- `replicas`, `strategy`, `paused`, `minReadySeconds`,
+  `progressDeadlineSeconds` — delivery and scale, not capability.
+- All annotations, all of `status`, and object metadata such as `uid` (the UID
+  is bound separately, in the signed envelope).
+- **Literal environment variable values**, so a value pasted inline never
+  reaches a public chain. This is a real gap, not just hygiene: see
+  [What PASS does not mean](#what-pass-does-not-mean).
+- The contents of referenced ConfigMaps and Secrets, and the bytes behind an
+  image tag.
 
-Excluded for good reasons — annotations are rewritten constantly by `kubectl
-apply`, Helm, cert-manager and mesh injectors; `status` is observed output, not
-declared intent; env **values** are excluded so a Secret can never leak into the
-hash, the logs, or a public chain:
+### Historical: the v1 surface
 
-- all annotations; all of `status`; `uid`, `resourceVersion`, `generation`,
-  timestamps, and all other object metadata
-- environment variable **values**
-
-Excluded with **no principled justification — these are gaps, not decisions**:
-
-- `initContainers` (including a malicious init step)
-- `command` and `args` — *a different program entirely, from the same image*
-- `securityContext` at pod and container level: `privileged`, `capabilities`,
-  `runAsUser`, `allowPrivilegeEscalation`
-- `serviceAccountName` and mounted tokens
-- `volumes` and `volumeMounts`, including `hostPath`, Secrets, ConfigMaps
-- `envFrom` and `valueFrom` — the *source* of a variable, not just its name
-- `hostNetwork`, `hostPID`, `hostIPC`
-- `ports`, `workingDir`, `imagePullPolicy`
-- probes and lifecycle hooks
-- scheduling: `nodeSelector`, `affinity`, `tolerations`, `runtimeClassName`
-- ephemeral containers
-- Deployment `strategy`, `paused`, `minReadySeconds`, `progressDeadlineSeconds`
-
-**Consequence.** An attacker who can change a Deployment's `command`, mount a
-`hostPath`, swap the `serviceAccountName`, add a privileged `initContainer`, or
-set `privileged: true` produces a workload that is materially more dangerous and
-**hashes identically**. `pod-verify` will print `PASS`.
-
-The current hash therefore represents a narrow slice of declarative identity —
-roughly "the same named containers, from the same image tags, with the same env
-var names and resource envelope". It does not represent what the workload does
-or what it is allowed to do. Widening this surface is the single highest-value
-change to the protocol, and it must be done as an explicit versioned change (see
-[Hash versioning](#hash-versioning)).
+v1 hashed only namespace, name, labels, replicas, selector, pod template labels,
+and per container the name, image string, env var names and resources. A
+workload made privileged, run as root with `hostPID` and the host filesystem
+mounted, under a different ServiceAccount and command, hashed **identically**
+and verified as `PASS`. `config/samples/demo-deployment-tampered.yaml` is that
+workload. It now **fails** under v2. v1 is retired: nothing publishes it, and
+`pod-verify` refuses it. Its normalizer and golden vectors are kept only to pin
+that weakness (`TestV1WeaknessIsPinned`, `TestV2DetectsTheTamperedWorkload`).
 
 ---
 
@@ -154,8 +166,8 @@ integrity, the supply chain, or the honesty of the cluster.
 | Compromised operator process | arbitrary hashes submitted for signing and publication | extraction of the KMS private key | with `kms:Sign` **and** `ETH_PRIVATE_KEY` it can publish a cryptographically valid attestation of anything |
 | Holder of `kms:Sign` | valid P-256 signatures over invented hashes | the on-chain write | can pre-sign; total compromise when combined with the EOA |
 | Holder of `ETH_PRIVATE_KEY` | overwrite `latest` with arbitrary bytes | a valid new KMS signature | denial of service and censorship by overwrite; contract is unrecoverable if the key is lost |
-| Any third party on the testnet | nothing in `latest` | `onlyPublisher`; the KMS signature | can read metadata and dictionary-attack Deployment IDs |
-| Compromised RPC provider | `getLatest` responses; whether a publish appears to land | a valid signature, if your key is trusted out of band | can serve a stale but validly-signed attestation; chain ID and finality are not checked |
+| Any third party on the testnet | nothing in `latest` | `onlyPublisher`; the KMS signature | can read metadata and dictionary-attack workload IDs |
+| Compromised RPC provider | `getLatest` responses; whether a publish appears to land | a valid signature, if your key is trusted out of band | can serve a stale but validly-signed attestation, or lie about chain id and code; finality is not checked |
 | Verifier with the wrong public key | its own root of trust | — | if the key and the RPC endpoint come from the same hostile channel, verification is circular |
 
 Two consequences worth stating plainly:
@@ -189,18 +201,18 @@ and redistributing its address to every consumer.
 | Situation | Behavior |
 |---|---|
 | Rollout in progress | Not attested until converged. The operator never slows the rollout. If it never converges, there is no attestation and no specific alarm. |
-| Operator restart with a pending queue | The queue is in memory and is lost. On restart the informer relists and the empty dedup cache re-enqueues converged Deployments — eventual recovery by accident, not durability. |
+| Operator restart | Publisher state is in memory and is lost. On restart the informer relists and every converged Deployment is re-enqueued; the publisher reads the chain first and does not republish a record that already matches and verifies. A transaction still pending at restart is forgotten, so it may be published a second time (same content, extra gas). |
 | Two replicas, `--leader-elect` | Only the leader publishes. This is what `config/manager/manager.yaml` sets. |
 | Two replicas, no leader election | Both observe, sign, and publish: duplicate gas and nonce contention. The binary defaults to `--leader-elect=false`; safety depends on the entry point. |
 | KMS throttled or IAM denied | Retried with 1s–5m backoff, indefinitely. **Liveness and readiness stay green.** A permanently broken attestor looks healthy. |
-| RPC down / tx never mined | `PublishAttestation` returns on *send*, not on receipt. A dropped, replaced, or reverted transaction is recorded as success and never retried. |
+| RPC down / tx not mined | A publication counts only once its receipt is mined. A send whose outcome is unknown keeps the same signed transaction and resends those exact bytes; a reverted one is rebuilt. Known gap: if another transaction takes the prepared transaction's nonce, that attempt is retried until restart or until the Deployment changes. There is no fee bumping and no confirmation depth. |
 | Deployment deleted | No tombstone is written. The on-chain `latest` record persists forever. |
-| Deployment recreated, same namespace/name | The dedup entry is dropped on the observed delete, so the new incarnation is attested. **Residual window:** `DeploymentID` is `SHA-256("namespace/name")` with no UID, so between the recreate and the new transaction being mined, `pod-verify` matches the new object against the *previous* incarnation's record and returns `PASS`. Closing this requires a protocol change. |
-| Config changed but hash-stable | `command`, `args`, `serviceAccountName`, volumes, security contexts — all change behavior without changing the hash. `PASS` persists. See [excluded fields](#what-fields-are-excluded-and-why). |
-| Secret value rotated | The hash does not change (values are never read). Neither does changing which Secret an `envFrom` points at. |
+| Deployment recreated, same namespace/name | The new object has a new UID, so the old record no longer matches: `pod-verify` reports an incarnation-mismatch `FAIL` until the new incarnation is attested. |
+| Config changed but hash-stable | Changing a literal env value (including one expanded into `command`/`args` via `$(VAR)`), the contents of a referenced ConfigMap or Secret, or what an image tag points at leaves the hash unchanged. `PASS` persists. See [What is hashed](#what-is-hashed-protocol-v2). |
+| Secret value rotated | The hash does not change (values are never read). Changing *which* Secret a variable or `envFrom` points at does change it. |
 | Image tag moved | Undetectable. The hash covers the tag string, not the digest. |
 | Publisher EOA lost | The registry becomes permanently unwritable. No recovery path. |
-| Operator attests itself | The watch is cluster-wide and does not exclude the operator's own namespace, so the manager's own Deployment is attested — including its mutable `:latest` tag. |
+| Operator attests itself | The watch is cluster-wide and does not exclude the operator's own namespace, so the manager's own Deployment is attested — when it runs in the cluster. |
 | Large cluster (thousands of Deployments) | Every converged Deployment costs one KMS call and one transaction. There is no batching, allowlist, quota, or backlog metric. A restart can re-enqueue everything. |
 
 ---
@@ -215,9 +227,8 @@ hashed payload would be unreachable at exactly the moment it is needed, and
 inferring it from the payload's shape would misverify as soon as two versions
 became shape-compatible.
 
-The version is also bound into the signed digest
-(`SHA-256(domain || version || configHash)`), so altering the stored version
-breaks signature verification rather than silently selecting the wrong
+The version is also bound into the signed envelope, so altering the stored
+version breaks signature verification rather than silently selecting the wrong
 normalizer.
 
 `pod-verify` **refuses** versions it does not implement. It never tries each in
@@ -226,8 +237,8 @@ a weaker hash surface by relabelling a record.
 
 | Version | Surface | Status |
 |---|---|---|
-| `v1` | Narrow — see [What fields are excluded and why](#what-fields-are-excluded-and-why). Every `v1` PASS prints a warning saying so. | what the operator publishes today |
-| `v2` | Execution and privilege: containers **and init containers**, command/args, env sources, volumes and mounts, security contexts, service account, image pull secrets, host namespaces, runtime class and placement. | implemented and verifiable; not yet published |
+| `v1` | Narrow — see [Historical: the v1 surface](#historical-the-v1-surface). | **retired**: not published, refused by `pod-verify` |
+| `v2` | Execution and privilege: containers **and init containers**, command/args, env sources, volumes and mounts, security contexts, service account, image pull secrets, host namespaces, runtime class and placement. | what the operator publishes and `pod-verify` accepts |
 
 v2 answers *"does this workload execute, and is it permitted to do, what was
 attested?"* — not *"is this Deployment identical in every declared field"*. It
@@ -238,31 +249,28 @@ would churn it on every stabilization.
 The benign and tampered demo workloads hash identically under v1 and
 **differently under v2**, which is the whole point of the change.
 
-See `docs/adr/0001-hash-protocol-v2.md` for the proposed v2.
+See `docs/adr/0001-hash-protocol-v2.md` and `docs/adr/0002-v2-encoding-and-verifier-contract.md`.
 
 ## Golden vectors
 
-`internal/attest/testdata` freezes the v1 wire format: for each fixture, the
-input Deployment, the exact canonical JSON bytes, the config hash and the
-deployment ID. Each fixture is self-checking — the test asserts that the stored
-hash really is SHA-256 of the stored JSON — and a fixed test key plus a
-precomputed signature pins the signing rule: the signature is taken over the
-version-bound digest (`SHA-256(domain || version || configHash)`) and over
-nothing else. Tests assert it verifies over neither the bare config hash nor a
-different protocol version.
+`internal/attest/testdata` pins the wire format. For each fixture there is the
+input Deployment, the exact canonical JSON bytes and the config hash, under v2
+(`canonical_v2.json`, `hashes_v2.txt`) and, as history, under v1. The v2
+identity encoding, incarnation, signing preimage and signing digest are pinned
+in `testdata/_envelope_v2/reference.txt`, and re-derived in CI by
+`reference.py`, an independent implementation written from the documented
+layout rather than from the Go code.
 
 A diff in any golden file is a protocol change. Regenerate deliberately:
 
 ```sh
-go test ./internal/attest -run TestGolden -update
+go test ./internal/attest -run 'TestGolden|TestV2GoldenVectors|TestEnvelopeGoldenVectors' -update
 ```
 
-One test asserts behaviour that is **wrong on purpose**: the benign/tampered
-pair that hashes alike. It is written to fail once the hash surface is widened,
-so closing that hole has to be a conscious, versioned decision rather than a
-silent one.
+The benign/tampered pair hashes alike under v1 (`TestV1WeaknessIsPinned`) and
+differently under v2 (`TestV2DetectsTheTamperedWorkload`).
 
-Writing these fixtures surfaced two determinism defects, both since fixed:
+Writing the v1 fixtures surfaced two determinism defects, both since fixed:
 `matchExpressions` sorted with no tiebreak on `values`, so declaration order
 leaked into the hash; and quantities were canonicalized by
 `resource.Quantity`'s format rather than its value, so `1Gi` and `1073741824`
@@ -281,12 +289,13 @@ attestation.
 
 Specifically: swapping `json.Marshal` for `MarshalIndent`, reordering a struct
 field, renaming a tag, or adding a field is a protocol change, not a
-refactor. Before modifying `internal/attest/types.go`, an explicit hash version
-must exist so old and new attestations can be told apart.
+refactor. Any such change to `internal/attest/types_v2.go` needs a new hash version.
 
 Determinism currently rests on struct declaration order, `encoding/json`'s
-documented sorting of map keys, explicit sorting of every slice in
-`normalize.go`, and `resource.Quantity.String()`. That last one is the least
+documented sorting of map keys, and, under v2, declared list order as the apiserver returns it.
+Quantities inside resources are canonicalized by value; quantities nested in
+embedded upstream types (for example an `emptyDir` size limit) use
+`resource.Quantity.String()`. That last one is the least
 guarded — its canonical form is decided by an upstream Kubernetes library, not by
 this repository. **Golden vectors are the real defense here**; the toolchain pin
 in `go.mod` is a precaution, not a guarantee. Both now exist — see
@@ -301,19 +310,21 @@ version, not across every version the project claims to support.
 |---|---|
 | `internal/attest` | normalization, hashing, signature verification — the protocol |
 | `internal/controller` | the passive Deployment watcher |
-| `internal/publisher` | off-reconcile sign-and-publish queue |
+| `internal/publisher` | off-reconcile sign-and-publish state machine (`PublisherV2`) |
 | `internal/signer` | AWS KMS signing |
-| `internal/chain` | typed wrapper over the registry contract |
+| `internal/chain` | v2 registry client (prepare/send/wait) and startup validation |
 | `cmd` | the operator (`manager`) |
 | `cmd/verify` | the `pod-verify` CLI — deliberately not shipped in the operator image |
-| `contracts` | `AttestationRegistry.sol` and its Hardhat tests |
+| `contracts` | `AttestationRegistryV2.sol` and its Hardhat tests |
 
 ## Running it locally
 
 `docs/local-demo.md` walks a clean checkout through to a receipt-confirmed
 `PASS` with no AWS account, no testnet and no cost: LocalStack stands in for KMS
-and a Hardhat node for the chain, neither of which needs a code change. It ends
-with two deliberate changes — one the hash detects, and one it does not.
+and a Hardhat node for the chain, neither of which needs a code change. It then
+changes the image, applies the privileged "tampered" workload, and recreates the
+Deployment; each one turns the result into `FAIL`. It is a manual runbook for
+now; there is no `make demo` yet.
 
 ## Building
 
@@ -335,7 +346,8 @@ The operator reads (flag or environment):
 |---|---|---|
 | `KMS_KEY_ID` | yes | key id, ARN, or alias; spec `ECC_NIST_P256`, usage `SIGN_VERIFY` |
 | `ETH_RPC_URL` | yes | testnet endpoint. **Never mainnet.** |
-| `CONTRACT_ADDRESS` | yes | deployed `AttestationRegistry` |
+| `CONTRACT_ADDRESS` | yes | deployed `AttestationRegistryV2` |
+| `CLUSTER_ID` | yes | stable identity of this cluster; part of every workload ID. Choose once, never change, never derive from the kubeconfig context. `pod-verify --cluster-id` must use the same value. |
 | `ETH_PRIVATE_KEY` | yes | throwaway testnet gas key; must be the account that deployed the contract |
 | `CHAIN_ID` | no | defaults to `84532` (Base Sepolia). An unparseable value silently falls back to the default. |
 
@@ -348,72 +360,30 @@ out of band.
 
 ## Known gaps
 
-Honest inventory, split by whether the code exists at all. The v2 path is being
-built beside the v1 one and switched over at the end, so "implemented" and "what
-the operator runs" are different questions and this section keeps them apart.
+Verify against the code before relying on this list.
 
-Verify against the code before relying on this list. It has drifted twice.
-
-### What the operator actually runs today
-
-This is the honest answer to "what is the risk right now".
-
-- It publishes **`v1`**, whose surface is too narrow to support a strong "proof
-  of deploy" claim. A privileged workload produces the same hash and the same
-  `PASS`, demonstrated in `config/samples/demo-deployment-tampered.yaml`.
-- It uses the **v1 chain client**, which treats *sent* as *published*: no
-  receipt, no finality, no reorg handling.
-- It performs **no startup validation** of the RPC, chain id or contract.
-- It attests **every Deployment in the cluster**, including its own.
-- Readiness is `healthz.Ping`, so a permanently failing pipeline reports Ready,
-  and there are no metrics for queue depth, signing or publication.
-
-### Built and tested, not yet wired
-
-`go run golang.org/x/tools/cmd/deadcode@latest ./cmd/...` names what no binary
-reaches: 40 functions, all in the five files below.
-
-`NormalizeV2` is the exception and is NOT on that list. `pod-verify` reaches it
-through `ConfigHashForVersion`, so the CLI can already verify a v2 record — it
-simply never encounters one, because nothing publishes them.
-
-- **`WorkloadIdentityV2` and `EnvelopeV2`**: cluster-aware identity with an
-  injective encoding, and a signed envelope binding version, identity,
-  incarnation and config hash.
-- **`AttestationRegistryV2`** and its Go client, with `Prepare`/`Send`/`Wait`,
-  receipt outcomes and retry by resending the same signed transaction.
-- **`PublisherV2`**: the pending/confirmed/retryable state machine, which
-  verifies the on-chain signature before confirming.
-- **Startup validation** of chain id, contract bytecode and `publisher()`.
-
-The KMS signer hardening IS wired: key spec, curve, canonical alias resolution
-and per-signature verification all run in the operator today.
-
-### Not built
-
-- `DeploymentID` carries no incarnation, so under v1 a recreated Deployment can
-  match its predecessor's record. v2's envelope binds one; the switch closes it.
-- `image` is a tag string, not a resolved digest. v2 does not change this — see
-  the ADR for why resolving is a trust-model change, not a fix.
-- Opt-in workload selection, mandatory cluster identity, and the coordinated
-  switch to v2.
-- An end-to-end job in CI. The local path is documented and has been executed,
-  but nothing runs it automatically, so it can rot silently — and the per-package
-  checks do not catch that, since each layer passes on its own.
-- `pod-verify` exits `1` for both a semantic FAIL and an operational error, and
-  prints a failure to stdout and stderr both.
+- **Not shown end to end in CI.** Every layer is tested on its own, including
+  the chain client against a real Hardhat node, but nothing runs operator, KMS,
+  chain and verifier together automatically. The local path is a manual
+  runbook.
+- **Literal env values are not hashed** (see
+  [What PASS does not mean](#what-pass-does-not-mean)).
+- **No freshness or ordering.** Whoever holds the publisher account can re-post
+  an older, validly signed record.
+- **Stuck transactions.** A prepared transaction whose nonce is taken by another
+  is retried until restart; there is no fee bumping and no confirmation depth.
+- **Pending transactions do not survive a restart** and may be published twice.
+- **A failing pipeline looks healthy.** Readiness is `healthz.Ping`, and there
+  are no metrics for pending work, signing or publication.
+- **Every Deployment in the cluster is attested**, including the operator's own
+  when it runs in-cluster. There is no opt-in or namespace selection.
+- **The KMS key cannot be rotated** without every existing record failing
+  verification; the verifier accepts one key.
+- `image` is a tag string, not a resolved digest, and the verifier does not
+  warn about mutable tags yet (ADR 0001, Decision 4).
+- No manifest mode, and no PARTIAL result (ADR 0002, Decision 3).
 - Hardhat falls back to a live public RPC when `RPC_URL` is unset.
 
-v1 filters pod template labels through the generated-label denylist but not
-`Selector.MatchLabels`. In v2 that asymmetry is deliberate and documented —
-controllers inject into the former and not the latter — but v1's was never
-argued, so treat it as unexamined rather than decided.
-
-**Before this is more than a demo**, at minimum: the v2 switch completed,
-cluster-aware identity, delivery reconciled through receipt and finality,
-documented key rotation, an end-to-end test that runs itself, observability that
-notices a dead attestor, explicit workload selection, and a published threat
-model.
-
-`docs/adr/0001-hash-protocol-v2.md` records the accepted design for closing the
-protocol gaps.
+`docs/adr/0001-hash-protocol-v2.md` and `docs/adr/0002-v2-encoding-and-verifier-contract.md`
+record the protocol design. Parts of ADR 0002 were changed during
+implementation; the code is authoritative where they differ.
