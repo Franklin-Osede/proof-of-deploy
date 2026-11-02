@@ -323,8 +323,14 @@ version, not across every version the project claims to support.
 `PASS` with no AWS account, no testnet and no cost: LocalStack stands in for KMS
 and a Hardhat node for the chain, neither of which needs a code change. It then
 changes the image, applies the privileged "tampered" workload, and recreates the
-Deployment; each one turns the result into `FAIL`. It is a manual runbook for
-now; there is no `make demo` yet.
+Deployment; each one turns the result into `FAIL`.
+
+`make demo` runs the core of that in one command, on throwaway infrastructure it
+creates and removes itself: the real operator attests a Deployment (`PASS`), the
+operator is stopped and the container made privileged with the same image
+(`FAIL`), and the change is reverted on the same object (`PASS`). It asserts the
+verifier's exit codes and exits nonzero if any differ. It needs docker, kind,
+kubectl, the AWS CLI, go, node and python3.
 
 ## Building
 
@@ -362,10 +368,8 @@ out of band.
 
 Verify against the code before relying on this list.
 
-- **Not shown end to end in CI.** Every layer is tested on its own, including
-  the chain client against a real Hardhat node, but nothing runs operator, KMS,
-  chain and verifier together automatically. The local path is a manual
-  runbook.
+- **The end-to-end demo covers the happy path and one tamper.** `make demo`
+  does not yet cover an operator restart or any publishing failure.
 - **Literal env values are not hashed** (see
   [What PASS does not mean](#what-pass-does-not-mean)).
 - **No freshness or ordering.** Whoever holds the publisher account can re-post

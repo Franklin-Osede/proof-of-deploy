@@ -88,6 +88,14 @@ docker-build: ## Build the operator container image.
 	  --build-arg DATE=$(DATE) \
 	  -t ${IMG} .
 
+##@ Demo
+# Needs docker, kind, kubectl, the AWS CLI, node and python3. Creates and then
+# removes its own kind cluster, LocalStack container and Hardhat node; touches
+# nothing else. DEMO_KEEP=1 leaves them up for inspection.
+.PHONY: demo
+demo: ## Run PASS -> tamper -> FAIL -> restore -> PASS on throwaway local infrastructure.
+	hack/demo.sh
+
 ##@ Deployment
 .PHONY: deploy
 deploy: ## Deploy the operator using kustomize (config/default).
