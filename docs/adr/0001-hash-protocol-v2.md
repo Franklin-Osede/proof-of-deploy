@@ -1,7 +1,20 @@
 # ADR 0001 — Protocol v2: signed envelope, identity, and hash surface
 
-**Status:** accepted. Decision 0 is implemented; Decisions 1–8 are accepted and
-not yet implemented.
+**Status:** accepted and implemented on the v2 cutover, with the exceptions
+below. The operator publishes v2 only and `pod-verify` accepts v2 only.
+
+| Decision | State |
+|---|---|
+| 0 — version on-chain | implemented |
+| 1 — v2 hash surface | implemented (`internal/attest/normalize_v2.go`) |
+| 2 — identity and incarnation | implemented; the manifest-mode output in "Verifier output" is **not** built |
+| 3 — signed envelope | implemented (`internal/attest/envelope.go`) |
+| 4 — images | the operator hashes the declared reference; the verifier's tag classification and warnings are **not** built |
+| 5 — v1/v2 compatibility | **amended**: v1 was removed rather than gated behind `--allow-v1` (see Decision 5) |
+| 6 — storage and events | implemented (`contracts/contracts/AttestationRegistryV2.sol`) |
+| 7 — batching | deferred, as decided; the volume-reducing fixes listed there are **not** built either |
+| 8 — immutable publisher | implemented |
+
 **Supersedes:** nothing. v1 is the format frozen in `internal/attest/testdata`.
 
 ## Context
@@ -37,9 +50,10 @@ The version is therefore stored on-chain, bound into the signed digest, and
 unknown versions are a hard error — never a fallback, because trying each
 version in turn is a downgrade oracle for anyone able to write on-chain.
 
-Implemented in `internal/attest/version.go`, `AttestationRegistry.sol` and
-`cmd/verify`. **Decision 3 below extends the signed digest and supersedes the
-current `SigningDigest` shape.**
+Implemented in `internal/attest/version.go`, the registry contract and
+`cmd/verify`. The v1 contract (`AttestationRegistry.sol`) has since been removed;
+`AttestationRegistryV2.sol` stores the version the same way. Decision 3 below
+extended the signed digest and replaced the original `SigningDigest` shape.
 
 ## Decision 1 — What v2 hashes
 
@@ -249,6 +263,13 @@ platform-specific image. Far better than a tag; still not runtime attestation.
   must be a deliberate act.
 - v1 output keeps saying its surface is weak.
 
+**Amended at the cutover:** v1 was removed instead. The project is a testnet
+demonstration with no consumers that need v1 records verified, and a flag that
+re-enables a known-weak surface is a downgrade path whoever runs the verifier
+can be talked into. `pod-verify` has no `--allow-v1` and refuses any record
+whose version is not v2. The v1 normalizer and its golden vectors remain only to
+pin the weakness (`TestV1WeaknessIsPinned`).
+
 **Correction of terminology:** v1 is not supported for "reading history". The
 contract is latest-only, so what survives is the `latest` slot of a known v1
 contract plus its events — and those events do not carry the signature. v1 is
@@ -333,7 +354,9 @@ Deliberately **not** starting with the normalizer.
    across and its assertion **inverted**.~~ Done — `internal/attest/normalize_v2.go`.
    The pair is equal under v1 and unequal under v2, asserted by
    `TestV2DetectsTheTamperedWorkload`.
-5. Operator and CLI.
+5. ~~Operator and CLI.~~ Done — the operator publishes through `PublisherV2`
+   and `internal/chain/client_v2.go`; `pod-verify` reads `AttestationRegistryV2`
+   and checks the incarnation. `make demo` exercises both end to end.
 
 Writing the normalizer first risks discovering late that the contract, KMS and
 CLI each signed a different notion of identity.
@@ -349,6 +372,6 @@ benefit. Documented in `NormalizeV2` rather than left to look like an oversight.
 
 ## Still open
 
-`CurrentVersion` remains v1: `NormalizeV2` exists and v2 records verify, but the
-operator and chain client are not yet wired to the v2 contract. Flipping it
-before that would publish v2 hashes into a v1 registry. That is step 5.
+`CurrentVersion` is v2 (`internal/attest/version.go`). What remains unbuilt from
+this ADR is listed in the status table at the top: manifest mode, image-reference
+warnings, and the volume-reducing fixes from Decision 7.
