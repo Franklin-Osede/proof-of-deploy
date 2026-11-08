@@ -172,7 +172,7 @@ UID, and the record was signed for the old one.
 
 Literal environment values, the contents of referenced ConfigMaps and Secrets,
 what the ServiceAccount is allowed to do, and what a mutable image tag points
-at. See README "What fields are excluded and why".
+at. See README "What PASS does not mean".
 
 ## Running the operator inside the cluster
 
@@ -182,7 +182,7 @@ on your host.
 
 ```sh
 make docker-build
-kind load docker-image proof-of-deploy:latest --name proof-of-deploy
+kind load docker-image proof-of-deploy:v0.1.0-experimental --name proof-of-deploy
 kubectl -n proof-of-deploy-system create secret generic proof-of-deploy-config \
   --from-literal=KMS_KEY_ID=... \
   --from-literal=ETH_RPC_URL=... \

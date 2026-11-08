@@ -2,13 +2,17 @@
 
 A Kubernetes operator that observes `apps/v1` Deployments, hashes a normalized
 subset of each converged Deployment's configuration, signs that hash with an AWS
-KMS key, and records the signature on a public EVM testnet. A companion CLI
-(`pod-verify`) independently recomputes the hash from a live cluster and checks
-it against the on-chain record.
+KMS key, and records the signature in a registry contract on an EVM chain. A
+companion CLI (`pod-verify`) independently recomputes the hash from a live
+cluster and checks it against the on-chain record.
 
-> **Status: testnet demonstration.** Not production software. Never point it at
-> mainnet, and never fund the Ethereum account it uses with real value. The
-> operator publishes and the verifier accepts **hash protocol v2 only**. See
+> **Status: demonstration, run locally.** Not production software. It is built
+> for a public EVM testnet such as Base Sepolia, but **no testnet run is
+> recorded yet**: the evidence in this repository is `make demo`, which runs the
+> real operator and verifier against a local Hardhat chain with LocalStack
+> standing in for KMS, and passes in CI. Never point it at mainnet, and never
+> fund the Ethereum account it uses with real value. The operator publishes and
+> the verifier accepts **hash protocol v2 only**. See
 > [What PASS means](#what-pass-means) for exactly what a `PASS` claims,
 > [Known gaps](#known-gaps) for what is missing, and [SECURITY.md](SECURITY.md)
 > before reporting anything.
@@ -202,7 +206,7 @@ and redistributing its address to every consumer.
 |---|---|
 | Rollout in progress | Not attested until converged. The operator never slows the rollout. If it never converges, there is no attestation and no specific alarm. |
 | Operator restart | Publisher state is in memory and is lost. On restart the informer relists and every converged Deployment is re-enqueued; the publisher reads the chain first and does not republish a record that already matches and verifies. A transaction still pending at restart is forgotten, so it may be published a second time (same content, extra gas). |
-| Two replicas, `--leader-elect` | Only the leader publishes. This is what `config/manager/manager.yaml` sets. |
+| Two replicas, `--leader-elect` | Only the leader publishes. `config/manager/manager.yaml` runs one replica with `--leader-elect` set. |
 | Two replicas, no leader election | Both observe, sign, and publish: duplicate gas and nonce contention. The binary defaults to `--leader-elect=false`; safety depends on the entry point. |
 | KMS throttled or IAM denied | Retried with 1s–5m backoff, indefinitely. **Liveness and readiness stay green.** A permanently broken attestor looks healthy. |
 | RPC down / tx not mined | A publication counts only once its receipt is mined. A send whose outcome is unknown keeps the same signed transaction and resends those exact bytes; a reverted one is rebuilt. Known gap: if another transaction takes the prepared transaction's nonce, that attempt is retried until restart or until the Deployment changes. There is no fee bumping and no confirmation depth. |
@@ -297,10 +301,11 @@ Quantities inside resources are canonicalized by value; quantities nested in
 embedded upstream types (for example an `emptyDir` size limit) use
 `resource.Quantity.String()`. That last one is the least
 guarded — its canonical form is decided by an upstream Kubernetes library, not by
-this repository. **Golden vectors are the real defense here**; the toolchain pin
-in `go.mod` is a precaution, not a guarantee. Both now exist — see
-[Golden vectors](#golden-vectors) — though the vectors run only on the pinned Go
-version, not across every version the project claims to support.
+this repository. **Golden vectors are the real defense here.** CI installs the
+Go version named by the `go` directive in `go.mod` (1.22.0), which is a
+precaution, not a guarantee: `go.mod` sets a minimum, not a `toolchain` pin, and
+the vectors run in CI only on that one version. See
+[Golden vectors](#golden-vectors).
 
 ---
 
@@ -315,22 +320,40 @@ version, not across every version the project claims to support.
 | `internal/chain` | v2 registry client (prepare/send/wait) and startup validation |
 | `cmd` | the operator (`manager`) |
 | `cmd/verify` | the `pod-verify` CLI — deliberately not shipped in the operator image |
-| `contracts` | `AttestationRegistryV2.sol` and its Hardhat tests |
+| `contracts` | Hardhat project: `contracts/AttestationRegistryV2.sol`, its tests and the deploy script |
+| `hack/demo.sh` | the end-to-end demo behind `make demo` |
 
 ## Running it locally
 
-`docs/local-demo.md` walks a clean checkout through to a receipt-confirmed
-`PASS` with no AWS account, no testnet and no cost: LocalStack stands in for KMS
-and a Hardhat node for the chain, neither of which needs a code change. It then
-changes the image, applies the privileged "tampered" workload, and recreates the
-Deployment; each one turns the result into `FAIL`.
+No AWS account, no testnet and no cost: LocalStack stands in for KMS and a
+Hardhat node for the chain, and neither needs a code change.
 
-`make demo` runs the core of that in one command, on throwaway infrastructure it
-creates and removes itself: the real operator attests a Deployment (`PASS`), the
-operator is stopped and the container made privileged with the same image
-(`FAIL`), and the change is reverted on the same object (`PASS`). It asserts the
-verifier's exit codes and exits nonzero if any differ. It needs docker, kind,
-kubectl, the AWS CLI, go, node and python3.
+**Prerequisites:** a running Docker daemon, `kind`, `kubectl`, the AWS CLI,
+`go`, `node` (with npm), `python3` and `curl`.
+
+```sh
+make demo
+```
+
+It creates a kind cluster, a LocalStack container and a Hardhat node, each named
+with a per-run id, and removes them on exit (`DEMO_KEEP=1` leaves them up). It
+runs the real operator and the real verifier and asserts on the verifier's exit
+codes:
+
+| Step | What happens | Expected |
+|---|---|---|
+| 1 | the operator attests `demo/api` | `PASS`, exit 0 |
+| 2 | the operator is stopped; the container is made privileged with `hostPID`, same image | `FAIL  config hash mismatch`, exit 1 |
+| 3 | the change is reverted on the same object (same UID) | `PASS`, exit 0 |
+
+It exits nonzero if any step differs, and prints the operator, chain and
+verifier logs when it does. The same command runs as the `End-to-end demo` job
+in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). It does not yet cover
+an operator restart or a publishing failure.
+
+[`docs/local-demo.md`](docs/local-demo.md) does the same by hand, step by step,
+and adds two more cases: a changed image, and a deleted-and-recreated Deployment
+that `FAIL`s as an incarnation mismatch.
 
 ## Building
 
@@ -368,6 +391,8 @@ out of band.
 
 Verify against the code before relying on this list.
 
+- **No testnet run is recorded.** Everything demonstrated so far ran on a local
+  Hardhat chain.
 - **The end-to-end demo covers the happy path and one tamper.** `make demo`
   does not yet cover an operator restart or any publishing failure.
 - **Literal env values are not hashed** (see
@@ -375,7 +400,9 @@ Verify against the code before relying on this list.
 - **No freshness or ordering.** Whoever holds the publisher account can re-post
   an older, validly signed record.
 - **Stuck transactions.** A prepared transaction whose nonce is taken by another
-  is retried until restart; there is no fee bumping and no confirmation depth.
+  is retried until restart or until the Deployment changes. This follows from
+  the code but has not been reproduced in a test yet; that is the next piece of
+  work. There is no fee bumping and no confirmation depth.
 - **Pending transactions do not survive a restart** and may be published twice.
 - **A failing pipeline looks healthy.** Readiness is `healthz.Ping`, and there
   are no metrics for pending work, signing or publication.
@@ -389,5 +416,10 @@ Verify against the code before relying on this list.
 - Hardhat falls back to a live public RPC when `RPC_URL` is unset.
 
 `docs/adr/0001-hash-protocol-v2.md` and `docs/adr/0002-v2-encoding-and-verifier-contract.md`
-record the protocol design. Parts of ADR 0002 were changed during
-implementation; the code is authoritative where they differ.
+record the protocol design. ADR 0002 was amended during implementation, and
+each amendment is marked where it appears. [CHANGELOG.md](CHANGELOG.md) lists
+what changed since the last release.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

@@ -1,5 +1,7 @@
 # Overlay for a locally built image loaded into a kind cluster with
-#   kind load docker-image proof-of-deploy:latest --name proof-of-deploy
+#   kind load docker-image proof-of-deploy:v0.1.0-experimental --name proof-of-deploy
+# The tag must match IMAGE_TAG in the Makefile and newTag in
+# config/manager/kustomization.yaml, which is what `make docker-build` builds.
 #
 # kind nodes have no registry credentials and the image exists only in the
 # node's containerd store, so the pull policy must not force a registry pull.
