@@ -94,6 +94,11 @@ mined yet.
   `repo/app:latest` can point at different bytes tomorrow with no hash change.
 - It does not prove the apiserver's view matches what the nodes actually run,
   or what mutating admission webhooks added to the Pods.
+- It does not prove the running Pods have converged to the declared
+  configuration. The operator attests only converged rollouts, but `pod-verify`
+  reads the Deployment's spec and does not check its rollout status or
+  `paused`. Whether a paused, partly rolled-out Deployment can show `PASS` while
+  Pods from another revision keep running has not been reproduced yet.
 - It does not prove the cluster, kubelet, registry, or operator was honest when
   the attestation was produced.
 - It does not prove KMS only ever signed authorized states.
@@ -134,7 +139,10 @@ Deployment labels, selector and pod template labels.
 - `replicas`, `strategy`, `paused`, `minReadySeconds`,
   `progressDeadlineSeconds` — delivery and scale, not capability.
 - All annotations, all of `status`, and object metadata such as `uid` (the UID
-  is bound separately, in the signed envelope).
+  is bound separately, in the signed envelope). Some pod template annotations,
+  such as the legacy AppArmor and seccomp ones, are meant to change a
+  container's isolation. What they do on the Kubernetes versions this targets
+  has not been checked yet.
 - **Literal environment variable values**, so a value pasted inline never
   reaches a public chain. This is a real gap, not just hygiene: see
   [What PASS does not mean](#what-pass-does-not-mean).
@@ -403,6 +411,15 @@ Verify against the code before relying on this list.
   is retried until restart or until the Deployment changes. This follows from
   the code but has not been reproduced in a test yet; that is the next piece of
   work. There is no fee bumping and no confirmation depth.
+- **Rollback while a transaction is pending.** If a Deployment is rolled back
+  while the newer revision's transaction has not mined, the chain can end up
+  holding the newer revision. The operator treats the rollback as already
+  published and does not correct it until it restarts or the Deployment changes
+  again. Reproduced with the publisher's test doubles; the test is not
+  committed yet and the bug is not fixed.
+- **`pod-verify` checks declared configuration, not convergence.** It does not
+  read rollout status or `paused` (see
+  [What PASS does not mean](#what-pass-does-not-mean)).
 - **Pending transactions do not survive a restart** and may be published twice.
 - **A failing pipeline looks healthy.** Readiness is `healthz.Ping`, and there
   are no metrics for pending work, signing or publication.

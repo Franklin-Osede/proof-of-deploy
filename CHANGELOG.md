@@ -42,11 +42,22 @@ contract are not readable by this version.
   the weakness that motivated v2.
 
 ### Fixed
-- Rolling a Deployment back to its last published state while a newer revision
-  was still in flight left the newer one on chain. The rollback is now
-  republished once the chain shows it is needed.
+- A rollback to the last published state was dropped as already published,
+  even while a newer revision was desired. If the newer revision's transaction
+  has already mined when the rollback is processed, the rollback is now
+  republished. If that transaction is still pending, the problem remains: see
+  Known limitations.
 
 ### Known limitations
+- Rolling back while the newer revision's transaction is still pending can
+  leave the newer revision on chain. The operator reads the older record,
+  treats the rollback as published, and does not correct it once the pending
+  transaction mines, until it restarts or the Deployment changes again.
+  Reproduced with the publisher's test doubles in a test that is not yet
+  committed; not fixed.
+- `pod-verify` checks the Deployment's declared configuration. It does not
+  confirm that the running Pods have converged to it: it does not read rollout
+  status or `paused`.
 - A prepared transaction whose nonce is taken by another transaction is retried
   until the operator restarts or the Deployment changes. Not yet reproduced in a
   test; tracked as the next piece of work.
