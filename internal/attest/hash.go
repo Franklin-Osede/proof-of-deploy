@@ -52,11 +52,3 @@ func ConfigHash(nd NormalizedDeployment) ([32]byte, error) {
 func MustHex(h [32]byte) string {
 	return hex.EncodeToString(h[:])
 }
-
-// DeploymentID is a stable identifier hash for a namespace/name pair. It is the
-// on-chain key under which a Deployment's attestations are recorded. Using a
-// hash (rather than raw strings) keeps the on-chain identifier fixed-width and
-// avoids leaking arbitrary namespace/name strings on a public testnet.
-func DeploymentID(namespace, name string) [32]byte {
-	return sha256.Sum256([]byte(namespace + "/" + name))
-}

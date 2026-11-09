@@ -1,6 +1,15 @@
 # ADR 0002 — v2 wire encoding, field resolution, and the verifier contract
 
-**Status:** proposed.
+**Status:** accepted, amended during implementation. Decision 2 (the encoding)
+is implemented as written. Three parts were changed when the code was written;
+each is marked **Amended** where it appears, and the code is authoritative:
+
+- `priorityClassName` and `preemptionPolicy` are **hashed**, not excluded
+  (Decision 1).
+- The `MatchLabels` asymmetry was **kept** on purpose (Decision 1).
+- The exit codes are `0` PASS, `1` FAIL, `2` error, and PARTIAL (`3`) is not
+  built (Decision 3).
+
 **Extends:** ADR 0001, which is accepted. This resolves the three things 0001
 deferred: the eight fields left "to be evaluated against the rule", the exact
 byte encoding it required to be unambiguous, and the verifier output contract it
@@ -70,6 +79,10 @@ The two exclusions are consistent with `replicas`: v2 does not attest
 availability, and priority only determines what happens when availability is
 already at risk.
 
+**Amended:** both are **hashed** (`internal/attest/normalize_v2.go`). ADR 0001
+records the reason used: they let a workload displace others. All eight fields
+above are in.
+
 ### The `MatchLabels` asymmetry
 
 0001 lists this as still open: pod template labels are filtered through the
@@ -87,6 +100,13 @@ This must be **confirmed against a live Deployment and pinned by a fixture
 before the denylist is removed**, not assumed. If some controller does write a
 generated label onto a Deployment's template, filtering both sides symmetrically
 is the fallback. Either outcome is acceptable; the asymmetry is not.
+
+**Amended:** the asymmetry was kept, and this section's conclusion was wrong.
+Nothing injects into a Deployment's selector, and it is immutable in `apps/v1`,
+so filtering it through the denylist could only make two genuinely different
+selectors hash the same. Template labels stay filtered because controllers and
+tooling do write there. The reasoning is recorded on `NormalizeV2` and in ADR
+0001, "Resolved during implementation".
 
 ## Decision 2 — The exact encoding
 
@@ -197,6 +217,19 @@ CONFIG MATCH  payments/api
   incarnation: NOT VERIFIED (manifest has no Kubernetes UID)
 ```
 
+**Amended:** what `pod-verify` implements (`cmd/verify/main.go`) is:
+
+| Code | Meaning |
+|---|---|
+| `0` | **PASS** |
+| `1` | **FAIL** — verification completed and the answer is no, including a record that binds no incarnation |
+| `2` | **error** — nothing was decided: RPC, kubeconfig, contract, missing flags, or a record whose version is not v2 |
+
+The numbering differs from the table above, but the property this decision
+exists for holds: a caller can tell "no" from "could not tell". PARTIAL is not
+built because neither of its cases exists: there is no manifest mode, and
+`--allow-v1` was dropped when v1 was removed (ADR 0001, Decision 5).
+
 ## Golden vectors required before implementation
 
 0001 requires vectors before code. Concretely, at minimum:
@@ -210,7 +243,9 @@ CONFIG MATCH  payments/api
    `{namespace: "a", name: "b/c"}` — asserted to produce *different* digests.
    This is the test that would have caught v1's non-injective construction, and
    it is the one that must exist before any encoder is written.
-5. A v1 and a v2 digest over the same config hash, asserted unequal.
+5. A v1 and a v2 digest over the same config hash, asserted unequal. (v1 is
+   removed; the test rebuilds the retired v1 digest itself, because signatures
+   made under it may still exist under the same key.)
 
 (4) is the reason this ADR exists. The others confirm the encoder; (4) confirms
 the encoding.
@@ -230,12 +265,13 @@ vectors, re-derives them, and exits non-zero on any disagreement.
 
 ## Consequences
 
-- `attest.DeploymentID` is superseded, not extended. It stays for reading v1
-  records under `--allow-v1`.
+- `attest.DeploymentID` is superseded, not extended. It was removed with v1;
+  there is no `--allow-v1`.
 - `clusterID` becomes required operator configuration, and the operator must
   refuse to start without it. There is no defensible default, and inferring one
   from kubeconfig is what 0001 forbids.
 - `SigningDigest`'s signature changes from `(Version, [32]byte)` to taking the
   full identity. Every caller is forced to supply it, which is the point.
-- `pod-verify` gains two exit codes. Any existing caller treating non-zero as
-  "failed" keeps working; callers that want the distinction now have it.
+- `pod-verify` separates FAIL from error (see the amendment to Decision 3). Any
+  caller treating non-zero as "failed" keeps working; callers that want the
+  distinction now have it.

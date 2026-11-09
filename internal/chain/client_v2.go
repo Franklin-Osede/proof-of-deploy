@@ -413,3 +413,7 @@ func (c *ClientV2) Close() {
 		c.ec.Close()
 	}
 }
+
+func typeErr(field string, v interface{}) error {
+	return fmt.Errorf("chain: unexpected ABI type for %s: %T", field, v)
+}

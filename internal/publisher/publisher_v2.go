@@ -32,12 +32,6 @@ import (
 // PublisherV2 owns the lifecycle of an attestation from "we observed this" to
 // "the chain holds it".
 //
-// It exists alongside the v1 publisher rather than replacing it. Wiring this to
-// the v1 contract would require weakening what "confirmed" means, because the
-// v1 record has no incarnation and so could never be matched exactly. A
-// deliberately vague confirmation is the exact ambiguity this design removes,
-// so the switch happens with the protocol switch and not before.
-//
 // The state it keeps per workload:
 //
 //	desired    the revision we want on chain, with its signature
@@ -54,6 +48,11 @@ import (
 //     a lost receipt is recovered.
 //   - A newer revision invalidates the older one, and no in-flight worker may
 //     confirm or publish on behalf of a revision that is no longer desired.
+//   - A confirmation is only trusted until a different revision is desired.
+//     After that something may have been sent for it, so a rollback to the
+//     confirmed state is re-checked against the chain, never assumed.
+//   - Superseded work is abandoned before it is sent, not after. A sent
+//     transaction cannot be recalled.
 //   - The chain is queried before the first Prepare, always. That is also what
 //     recovers state after a restart, when every attempt in memory is gone.
 type PublisherV2 struct {
@@ -150,9 +149,6 @@ type ChainV2 interface {
 	Wait(ctx context.Context, p PreparedTx) (WaitOutcome, error)
 }
 
-// Signer is declared in publisher.go and shared: both publishers need exactly
-// the same slice of the KMS signer.
-
 type workloadState struct {
 	desired Desired
 	// seq increases with every newly desired revision. An attempt carries the
@@ -224,9 +220,13 @@ func (p *PublisherV2) recordIsOurs(d Desired, sig []byte) bool {
 // Enqueue records a desired revision. It never blocks and never signs, so the
 // reconcile loop pays nothing for it.
 //
-// A revision identical to what we have already confirmed is dropped. Anything
-// else supersedes whatever was desired before for that workload, including any
+// A revision that is both desired and confirmed is dropped. Anything else
+// supersedes whatever was desired before for that workload, including any
 // attempt in flight for it.
+//
+// Being confirmed alone is not enough to drop it. If A is confirmed and B is
+// desired, B may already have been sent; a return to A must become the desired
+// revision again, and the chain decides whether it still needs publishing.
 func (p *PublisherV2) Enqueue(d Desired) error {
 	workloadID, err := d.Identity.WorkloadID()
 	if err != nil {
@@ -240,14 +240,13 @@ func (p *PublisherV2) Enqueue(d Desired) error {
 		st = &workloadState{}
 		p.state[workloadID] = st
 	}
-	if st.confirmed != nil && *st.confirmed == key {
-		p.mu.Unlock()
-		return nil
-	}
 	if st.seq != 0 && st.key == key {
-		// Already the desired revision; the existing attempt continues.
+		confirmed := st.confirmed != nil && *st.confirmed == key
 		p.mu.Unlock()
-		p.queue.Add(workloadID)
+		if !confirmed {
+			// Already the desired revision; the existing attempt continues.
+			p.queue.Add(workloadID)
+		}
 		return nil
 	}
 
@@ -259,6 +258,9 @@ func (p *PublisherV2) Enqueue(d Desired) error {
 	// Keeping either would risk publishing a superseded state.
 	st.signature = nil
 	st.prepared = nil
+	// What was confirmed described the chain before the revision now being
+	// replaced could be sent. It is no longer evidence of what the chain holds.
+	st.confirmed = nil
 	p.mu.Unlock()
 
 	p.queue.Add(workloadID)
@@ -314,8 +316,9 @@ func (p *PublisherV2) processNext(ctx context.Context) bool {
 	return true
 }
 
-// process advances one workload by one step. It returns (true, nil) when the
-// desired revision was confirmed but a newer one is already waiting.
+// process advances one workload by one step. It returns (true, nil) when a
+// newer revision is already waiting: either this one was confirmed after being
+// superseded, or it was superseded before it could be sent.
 func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 	rev, ok := p.snapshot(id)
 	if !ok {
@@ -344,6 +347,17 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 	prepared, err := p.prepareOnce(ctx, id, rev)
 	if err != nil {
 		return false, err
+	}
+
+	// Signing and the chain read both take time, and a newer revision may have
+	// arrived during either. This is the last point at which that can be acted
+	// on: once sent, the transaction cannot be recalled. The check and the send
+	// are not atomic, so a revision arriving between them is still sent; it is
+	// then superseded on chain by the newer one, which takes a later nonce.
+	if !p.isCurrent(id, rev.seq) {
+		p.log.V(1).Info("revision superseded before sending; abandoning it",
+			"deployment", rev.desired.Label)
+		return true, nil
 	}
 
 	sent, err := p.chain.Send(ctx, prepared)
@@ -439,7 +453,8 @@ func (p *PublisherV2) prepareOnce(ctx context.Context, id [32]byte, rev workload
 		st.signature = sig
 		st.prepared = prepared
 	}
-	// If the revision moved on, the caller's result will be discarded anyway.
+	// If the revision moved on, nothing is cached; process sees the same thing
+	// before sending and abandons the attempt.
 	return prepared, nil
 }
 
@@ -462,6 +477,14 @@ func (p *PublisherV2) confirm(id [32]byte, rev workloadState) bool {
 	}
 	st.prepared = nil
 	return false
+}
+
+// isCurrent reports whether seq is still the desired revision for a workload.
+func (p *PublisherV2) isCurrent(id [32]byte, seq uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st, ok := p.state[id]
+	return ok && st.seq == seq
 }
 
 func (p *PublisherV2) discardAttempt(id [32]byte, seq uint64) {

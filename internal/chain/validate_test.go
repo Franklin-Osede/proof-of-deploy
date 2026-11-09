@@ -304,10 +304,10 @@ func TestValidateRejectsAnAddressWithNoCode(t *testing.T) {
 }
 
 func TestValidateRejectsADifferentContract(t *testing.T) {
-	// The v1 registry also exposes publisher(), so it answers the call. Only
-	// comparing the code catches it.
+	// The impostor answers publisher() and getLatest() exactly as the real
+	// registry does. Only comparing the code catches it.
 	rc := newRealChain(t)
-	other := deployArtifact(t, rc, "AttestationRegistry",
+	other := deployArtifact(t, rc, "test/ImpostorRegistry",
 		crypto.PubkeyToAddress(mustKey(t, rc.priv).PublicKey))
 
 	cfg := Config{
@@ -368,7 +368,7 @@ func TestValidateRejectsAnUnreachableRPC(t *testing.T) {
 func deployArtifact(t *testing.T, rc *realChain, name string, arg common.Address) common.Address {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Clean(
-		"../../contracts/artifacts/contracts/" + name + ".sol/" + name + ".json"))
+		"../../contracts/artifacts/contracts/" + name + ".sol/" + filepath.Base(name) + ".json"))
 	if err != nil {
 		t.Skipf("artifact for %s not found: %v", name, err)
 	}

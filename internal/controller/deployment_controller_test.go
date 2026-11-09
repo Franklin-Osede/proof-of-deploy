@@ -33,14 +33,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	"github.com/franklin1014/proof-of-deploy/internal/attest"
 	"github.com/franklin1014/proof-of-deploy/internal/publisher"
 )
 
-// fakeEnqueuer records every Job the reconciler hands to the publisher, so a
-// test can assert exactly how many attestations were requested and for what.
-type fakeEnqueuer struct{ jobs []publisher.Job }
+const testCluster = "test-cluster"
 
-func (f *fakeEnqueuer) Enqueue(job publisher.Job) { f.jobs = append(f.jobs, job) }
+// fakeEnqueuer records every revision the reconciler hands to the publisher,
+// so a test can assert exactly what was requested.
+type fakeEnqueuer struct{ jobs []publisher.Desired }
+
+func (f *fakeEnqueuer) Enqueue(d publisher.Desired) error {
+	f.jobs = append(f.jobs, d)
+	return nil
+}
 
 func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -53,14 +59,16 @@ func testScheme(t *testing.T) *runtime.Scheme {
 
 // convergedDeployment returns a Deployment whose status satisfies
 // rolloutConverged: generation observed, and every replica counter equal to
-// the desired count.
-func convergedDeployment(namespace, name, image string) *appsv1.Deployment {
+// the desired count. The UID is set explicitly because the fake client does not
+// assign one, and the incarnation is derived from it.
+func convergedDeployment(namespace, name, image string, uid types.UID) *appsv1.Deployment {
 	const replicas int32 = 2
 	r := replicas
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:  namespace,
 			Name:       name,
+			UID:        uid,
 			Generation: 1,
 			Labels:     map[string]string{"app": name},
 		},
@@ -91,8 +99,7 @@ func requestFor(d *appsv1.Deployment) ctrl.Request {
 func newReconciler(t *testing.T, c client.Client) (*DeploymentReconciler, *fakeEnqueuer) {
 	t.Helper()
 	enq := &fakeEnqueuer{}
-	r := &DeploymentReconciler{Client: c, Scheme: testScheme(t), Publisher: enq}
-	r.lastAttested = make(map[[32]byte][32]byte)
+	r := &DeploymentReconciler{Client: c, Scheme: testScheme(t), Publisher: enq, ClusterID: testCluster}
 	return r, enq
 }
 
@@ -103,29 +110,47 @@ func mustReconcile(t *testing.T, r *DeploymentReconciler, req ctrl.Request) {
 	}
 }
 
-// TestConvergedDeploymentEnqueuedOnce asserts the happy path and the dedup: a
-// converged Deployment is attested, and re-reconciling the identical state
-// does not enqueue a second attestation (which would cost extra gas).
-func TestConvergedDeploymentEnqueuedOnce(t *testing.T) {
-	dep := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2")
+// TestConvergedDeploymentIsEnqueuedAsV2 asserts the happy path: a converged
+// Deployment is handed to the publisher under its full v2 identity, bound to
+// the UID of the object observed.
+//
+// Re-reconciling identical state enqueues the identical revision again. Not
+// publishing it twice is the publisher's job, which it does by comparing with
+// what it has confirmed (see TestMinedSuccessConfirmsAndStops).
+func TestConvergedDeploymentIsEnqueuedAsV2(t *testing.T) {
+	dep := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2", "uid-1")
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(dep).Build()
 	r, enq := newReconciler(t, c)
 
 	mustReconcile(t, r, requestFor(dep))
 	if len(enq.jobs) != 1 {
-		t.Fatalf("first reconcile: got %d enqueued jobs, want 1", len(enq.jobs))
+		t.Fatalf("first reconcile: got %d enqueued revisions, want 1", len(enq.jobs))
+	}
+	got := enq.jobs[0]
+	wantID := attest.WorkloadIdentityV2{
+		ClusterID: testCluster, APIVersion: "apps/v1", Kind: "Deployment",
+		Namespace: "payments", Name: "api",
+	}
+	if got.Identity != wantID {
+		t.Errorf("identity %+v, want %+v", got.Identity, wantID)
+	}
+	if got.UID != "uid-1" {
+		t.Errorf("UID %q, want the observed object's", got.UID)
+	}
+	if got.Version != attest.V2 {
+		t.Errorf("version %v, want v2", got.Version)
 	}
 
 	mustReconcile(t, r, requestFor(dep))
-	if len(enq.jobs) != 1 {
-		t.Fatalf("second reconcile of identical state: got %d jobs, want 1 (dedup failed)", len(enq.jobs))
+	if len(enq.jobs) != 2 || enq.jobs[1] != got {
+		t.Fatalf("re-reconcile of identical state must enqueue the identical revision, got %+v", enq.jobs)
 	}
 }
 
 // TestNotConvergedIsNotEnqueued asserts a rollout in progress is never
 // attested: transient states are not the applied state.
 func TestNotConvergedIsNotEnqueued(t *testing.T) {
-	dep := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2")
+	dep := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2", "uid-1")
 	dep.Status.ReadyReplicas = 1 // still rolling out
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(dep).Build()
 	r, enq := newReconciler(t, c)
@@ -136,59 +161,48 @@ func TestNotConvergedIsNotEnqueued(t *testing.T) {
 	}
 }
 
-// TestDeleteThenRecreateIsAttestedAgain is the regression test for the dedup
-// cache outliving the object it describes.
+// TestDeleteThenRecreateIsAttestedAgain: a Deployment is attested, deleted,
+// then recreated with a byte-identical spec.
 //
-// A Deployment is attested, deleted, then recreated with byte-identical spec.
-// The recreation is a NEW incarnation: it has its own UID and its own lifetime,
-// and the on-chain record left by the previous incarnation says nothing about
-// it. Because DeploymentID is SHA-256("namespace/name") and carries no UID,
-// leaving stale dedup state in place means the new incarnation is silently
-// covered by the OLD attestation's timestamp.
-//
-// Before the fix this test failed at the final assertion: the reconciler
-// retained lastAttested across the delete and skipped the recreation, despite
-// the comment on the NotFound branch promising the opposite.
+// The recreation is a NEW incarnation with its own lifetime, and the on-chain
+// record left by the previous one says nothing about it. v2 carries the UID,
+// so the recreation is a distinct revision even though its config hash is the
+// same, and the publisher cannot mistake it for the one already confirmed.
 func TestDeleteThenRecreateIsAttestedAgain(t *testing.T) {
-	dep := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2")
+	dep := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2", "uid-1")
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(dep).Build()
 	r, enq := newReconciler(t, c)
 	req := requestFor(dep)
 
-	// 1. Observed and attested.
 	mustReconcile(t, r, req)
 	if len(enq.jobs) != 1 {
-		t.Fatalf("initial reconcile: got %d jobs, want 1", len(enq.jobs))
+		t.Fatalf("initial reconcile: got %d revisions, want 1", len(enq.jobs))
 	}
-	firstJob := enq.jobs[0]
+	first := enq.jobs[0]
 
-	// 2. Deleted. Reconcile sees NotFound and must not attest anything.
 	if err := c.Delete(context.Background(), dep); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	mustReconcile(t, r, req)
 	if len(enq.jobs) != 1 {
-		t.Fatalf("reconcile after delete: got %d jobs, want 1 (a deletion is not attestable)", len(enq.jobs))
+		t.Fatalf("reconcile after delete: got %d revisions, want 1 (a deletion is not attestable)", len(enq.jobs))
 	}
 
-	// 3. Recreated with an identical spec — a new incarnation of the same
-	//    namespace/name, hashing to the same config hash.
-	recreated := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2")
+	recreated := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2", "uid-2")
 	if err := c.Create(context.Background(), recreated); err != nil {
 		t.Fatalf("recreate: %v", err)
 	}
 	mustReconcile(t, r, req)
 
 	if len(enq.jobs) != 2 {
-		t.Fatalf("reconcile after recreate: got %d jobs, want 2; "+
-			"the new incarnation was skipped by stale dedup state and is now "+
-			"covered only by the previous incarnation's attestation", len(enq.jobs))
+		t.Fatalf("reconcile after recreate: got %d revisions, want 2", len(enq.jobs))
 	}
-	if enq.jobs[1].ConfigHash != firstJob.ConfigHash {
+	second := enq.jobs[1]
+	if second.ConfigHash != first.ConfigHash {
 		t.Fatal("recreated Deployment hashed differently; the test no longer exercises the identical-spec case")
 	}
-	if enq.jobs[1].DeploymentID != firstJob.DeploymentID {
-		t.Fatal("recreated Deployment produced a different DeploymentID; expected namespace/name identity")
+	if second.UID == first.UID {
+		t.Fatal("the recreation carries the previous incarnation's UID")
 	}
 }
 
@@ -196,7 +210,7 @@ func TestDeleteThenRecreateIsAttestedAgain(t *testing.T) {
 // NotFound) is returned so controller-runtime retries it. Dropping it would
 // silently stop attesting a Deployment that still exists.
 func TestGetErrorIsPropagated(t *testing.T) {
-	dep := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2")
+	dep := convergedDeployment("payments", "api", "ghcr.io/acme/api:1.4.2", "uid-1")
 	boom := apierrors.NewInternalError(errors.New("apiserver unavailable"))
 	c := fake.NewClientBuilder().
 		WithScheme(testScheme(t)).

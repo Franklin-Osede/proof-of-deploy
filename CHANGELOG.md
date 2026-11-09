@@ -3,6 +3,67 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project is pre-1.0 and makes no compatibility promises.
 
+## [Unreleased]
+
+Hash protocol v2 replaces v1 everywhere. Existing v1 attestations and the v1
+contract are not readable by this version.
+
+### Changed
+- The operator publishes, and `pod-verify` accepts, **hash protocol v2 only**.
+  v2 covers execution and privilege (command, args, init containers, security
+  contexts, host namespaces, volumes, ServiceAccount, placement), binds the
+  cluster identity and the Deployment's UID into the signed envelope, and is
+  recorded in the new `AttestationRegistryV2` contract.
+- `CLUSTER_ID` (`--cluster-id`) is required by both the operator and
+  `pod-verify`.
+- `pod-verify` exit codes: `0` PASS, `1` FAIL, `2` could not decide. A
+  recreated Deployment with the same spec now FAILs as an incarnation mismatch.
+- A publication counts only once its receipt is mined. A send whose outcome is
+  unknown resends the same signed transaction instead of preparing a new one,
+  and a superseded revision is abandoned before it is sent.
+
+### Added
+- Startup validation. The operator refuses to run unless the RPC reports the
+  configured chain id, the address holds the expected registry bytecode, the
+  registry's publisher is the operator's account, and the KMS key is a P-256
+  signing key. `pod-verify` checks the chain id and the bytecode.
+- The publisher checks the on-chain signature before treating a record as
+  published.
+- `make demo`: a one-command run on throwaway local infrastructure (kind,
+  LocalStack for KMS, a Hardhat node) that asserts PASS, then FAIL after a
+  privilege escalation with the same image, then PASS after the revert. It runs
+  as a CI job.
+- Golden vectors for the v2 identity, incarnation and signing digest, checked
+  in CI against an independent Python implementation.
+
+### Removed
+- The v1 publishing and verification path, the v1 contract, and
+  `attest.DeploymentID`. The v1 normalizer and golden vectors remain only to pin
+  the weakness that motivated v2.
+
+### Fixed
+- A rollback to the last published state was dropped as already published,
+  even while a newer revision was desired. If the newer revision's transaction
+  has already mined when the rollback is processed, the rollback is now
+  republished. If that transaction is still pending, the problem remains: see
+  Known limitations.
+
+### Known limitations
+- Rolling back while the newer revision's transaction is still pending can
+  leave the newer revision on chain. The operator reads the older record,
+  treats the rollback as published, and does not correct it once the pending
+  transaction mines, until it restarts or the Deployment changes again.
+  Reproduced with the publisher's test doubles in a test that is not yet
+  committed; not fixed.
+- `pod-verify` checks the Deployment's declared configuration. It does not
+  confirm that the running Pods have converged to it: it does not read rollout
+  status or `paused`.
+- A prepared transaction whose nonce is taken by another transaction is retried
+  until the operator restarts or the Deployment changes. Not yet reproduced in a
+  test; tracked as the next piece of work.
+- Literal environment variable values, referenced ConfigMap and Secret
+  contents, and the bytes behind an image tag are not hashed. See the README.
+
 ## [v0.1.0-experimental] — 2026-08-31
 
 First tagged release. **Experimental. Testnet only. Not a production
@@ -100,4 +161,5 @@ the cluster, including its own), and metrics.
 Use this on mainnet, with real funds, or as evidence that a deployed workload is
 safe.
 
+[Unreleased]: https://github.com/Franklin-Osede/proof-of-deploy/compare/v0.1.0-experimental...HEAD
 [v0.1.0-experimental]: https://github.com/Franklin-Osede/proof-of-deploy/releases/tag/v0.1.0-experimental

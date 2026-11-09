@@ -17,8 +17,6 @@ limitations under the License.
 package attest
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -37,7 +35,12 @@ const (
 	// reads back as. It is never a valid protocol version.
 	VersionUnknown Version = 0
 
-	// V1 hashes a narrow subset of a Deployment: namespace, name, non-generated
+	// V1 is RETIRED. Nothing publishes it and the verifier refuses it. The
+	// normalizer is kept only as a pinned record of the weak surface that
+	// motivated v2 (see TestV1WeaknessIsPinned), and the number is never to be
+	// reused for anything else.
+	//
+	// It hashed a narrow subset of a Deployment: namespace, name, non-generated
 	// labels, replicas, selector, pod template labels, and for each normal
 	// container its name, image string, env var NAMES and resource
 	// requests/limits.
@@ -56,12 +59,9 @@ const (
 	// docs/adr/0001-hash-protocol-v2.md.
 	V2 Version = 2
 
-	// CurrentVersion is what the operator publishes.
-	//
-	// Still V1: NormalizeV2 exists and v2 records can be verified, but the
-	// operator and chain client are not yet wired to the v2 contract. Flipping
-	// this before that would publish v2 hashes into a v1 registry.
-	CurrentVersion = V1
+	// CurrentVersion is what the operator publishes. It only ever travels in
+	// a v2 envelope to the v2 registry.
+	CurrentVersion = V2
 )
 
 // ErrUnknownVersion is returned when asked to work with a protocol version this
@@ -107,29 +107,4 @@ func ConfigHashForVersion(v Version, d *appsv1.Deployment) ([32]byte, error) {
 	default:
 		return [32]byte{}, ErrUnknownVersion{Version: v}
 	}
-}
-
-// signingDomain separates these signatures from any other use of the same key.
-// Without it, a 34-byte structure signed elsewhere for an unrelated purpose
-// could be reinterpreted as an attestation.
-const signingDomain = "proof-of-deploy/attestation\x00"
-
-// SigningDigest is the 32 bytes actually signed: SHA-256 over a domain
-// separator, the protocol version, and the config hash.
-//
-// The version is bound cryptographically rather than only stored on-chain. The
-// stored value tells a verifier which normalizer to run; binding it here means
-// a record whose version field was altered fails signature verification instead
-// of merely being recomputed the wrong way.
-//
-// NOTE for anyone touching the KMS call: this is already a digest. KMS is
-// invoked with MessageType=DIGEST precisely so it does NOT hash again, and the
-// verifier passes these same bytes to ecdsa.VerifyASN1. Switching KMS to RAW,
-// or hashing once more on either side, silently breaks every signature.
-func SigningDigest(v Version, configHash [32]byte) [32]byte {
-	buf := make([]byte, 0, len(signingDomain)+2+32)
-	buf = append(buf, signingDomain...)
-	buf = binary.BigEndian.AppendUint16(buf, uint16(v))
-	buf = append(buf, configHash[:]...)
-	return sha256.Sum256(buf)
 }

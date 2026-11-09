@@ -29,5 +29,11 @@ module.exports = {
       chainId: 80002,
       accounts,
     },
+    // The throwaway node started by hack/demo.sh, on whatever port it picked.
+    // Defined only when DEMO_RPC_URL is set, so there is no default that could
+    // silently reach some other node already listening on 8545.
+    ...(process.env.DEMO_RPC_URL
+      ? { demo: { url: process.env.DEMO_RPC_URL, chainId: 31337 } }
+      : {}),
   },
 };

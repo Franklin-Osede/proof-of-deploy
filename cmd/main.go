@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -56,6 +57,7 @@ func main() {
 		ethRPCURL            string
 		contractAddr         string
 		chainID              int64
+		clusterID            string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
@@ -67,9 +69,11 @@ func main() {
 	flag.StringVar(&ethRPCURL, "eth-rpc-url", os.Getenv("ETH_RPC_URL"),
 		"Testnet JSON-RPC endpoint (Base Sepolia or Polygon Amoy). NEVER point this at mainnet.")
 	flag.StringVar(&contractAddr, "contract-address", os.Getenv("CONTRACT_ADDRESS"),
-		"Deployed AttestationRegistry contract address.")
+		"Deployed AttestationRegistryV2 contract address.")
 	flag.Int64Var(&chainID, "chain-id", envInt64("CHAIN_ID", 84532),
 		"EVM chain id. Default 84532 (Base Sepolia). Polygon Amoy is 80002.")
+	flag.StringVar(&clusterID, "cluster-id", os.Getenv("CLUSTER_ID"),
+		"Stable identity of this cluster, part of every workload ID. Must not change for the cluster's lifetime.")
 
 	opts := zap.Options{Development: true}
 	showVersion := flag.Bool("version", false, "Print the build version and exit.")
@@ -82,9 +86,10 @@ func main() {
 	}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	if kmsKeyID == "" || ethRPCURL == "" || contractAddr == "" {
+	if kmsKeyID == "" || ethRPCURL == "" || contractAddr == "" || clusterID == "" {
 		setupLog.Error(nil, "missing required configuration",
-			"kms-key-id", kmsKeyID != "", "eth-rpc-url", ethRPCURL != "", "contract-address", contractAddr != "")
+			"kms-key-id", kmsKeyID != "", "eth-rpc-url", ethRPCURL != "",
+			"contract-address", contractAddr != "", "cluster-id", clusterID != "")
 		os.Exit(1)
 	}
 	// The Ethereum account that pays testnet gas. This is unrelated to the KMS
@@ -114,13 +119,34 @@ func main() {
 		setupLog.Error(err, "unable to initialize KMS signer")
 		os.Exit(1)
 	}
-	chainWriter, err := chain.NewWriter(ctx, ethRPCURL, contractAddr, ethPrivateKey, big.NewInt(chainID))
+
+	// Prove the chain, the contract and the publishing account are what we
+	// were told before anything is signed or spent. A misconfiguration becomes
+	// a crash loop with a reason instead of a stream of failed publications.
+	report, err := chain.Validate(ctx, chain.Config{
+		RPCURL:          ethRPCURL,
+		ContractAddress: contractAddr,
+		ChainID:         chainID,
+		PrivateKeyHex:   ethPrivateKey,
+	}, true, 30*time.Second)
+	if err != nil {
+		setupLog.Error(err, "chain validation failed")
+		os.Exit(1)
+	}
+	setupLog.Info("chain validated",
+		"chainID", report.ChainID, "contract", report.Contract.Hex(), "publisher", report.Publisher.Hex())
+
+	chainWriter, err := chain.NewWriterV2(ctx, ethRPCURL, contractAddr, ethPrivateKey, big.NewInt(chainID))
 	if err != nil {
 		setupLog.Error(err, "unable to initialize chain writer")
 		os.Exit(1)
 	}
 
-	pub := publisher.New(kmsSigner, chainWriter, ctrl.Log)
+	pub, err := publisher.NewV2(kmsSigner, publisher.NewChainV2(chainWriter), ctrl.Log)
+	if err != nil {
+		setupLog.Error(err, "unable to initialize publisher")
+		os.Exit(1)
+	}
 	if err := mgr.Add(pub); err != nil {
 		setupLog.Error(err, "unable to register publisher runnable")
 		os.Exit(1)
@@ -130,6 +156,7 @@ func main() {
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		Publisher: pub,
+		ClusterID: clusterID,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Deployment")
 		os.Exit(1)
@@ -147,7 +174,7 @@ func main() {
 	// Log the signer's public-key fingerprint at startup so operators can
 	// confirm which key is in use without exposing key material.
 	setupLog.Info("starting proof-of-deploy operator",
-		"chainID", chainID, "contract", contractAddr, "kmsKeyID", kmsKeyID,
+		"chainID", chainID, "contract", contractAddr, "kmsKeyID", kmsKeyID, "clusterID", clusterID,
 		"signerFingerprint", attest.PublicKeyFingerprint(kmsSigner.PublicKeyDER()))
 	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")

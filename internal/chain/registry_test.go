@@ -40,12 +40,6 @@ var abiUnderTest = []struct {
 	required     []string
 }{
 	{
-		name:         "AttestationRegistry",
-		goABI:        RegistryABI,
-		artifactPath: "../../contracts/artifacts/contracts/AttestationRegistry.sol/AttestationRegistry.json",
-		required:     []string{"function publish", "function getLatest", "event AttestationPublished"},
-	},
-	{
 		name:         "AttestationRegistryV2",
 		goABI:        RegistryV2ABI,
 		artifactPath: "../../contracts/artifacts/contracts/AttestationRegistryV2.sol/AttestationRegistryV2.json",
@@ -173,7 +167,6 @@ func TestEveryABIConstantIsGuarded(t *testing.T) {
 	guarded := map[string]bool{}
 	for _, tc := range abiUnderTest {
 		for name, value := range map[string]string{
-			"RegistryABI":   RegistryABI,
 			"RegistryV2ABI": RegistryV2ABI,
 		} {
 			if tc.goABI == value {
