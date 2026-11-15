@@ -24,6 +24,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -495,6 +496,71 @@ func TestRollbackAfterTheNewRevisionLanded(t *testing.T) {
 	p.mu.Unlock()
 	if confirmed == nil || *confirmed != p.revisionKey(revA) {
 		t.Errorf("confirmed %v, want A", confirmed)
+	}
+}
+
+// TestRollbackWhileTheNewRevisionIsPending: A is on chain, B is sent and its
+// outcome is unknown, the Deployment returns to A while B is still pending, and
+// only then does B mine. The chain now holds B while the Deployment is A, so A
+// must be published again within a few reconcile passes.
+//
+// Known limitation (CHANGELOG "Known limitations"): this fails today. The
+// rollback pass reads A on chain and confirms it, and a confirmed revision is
+// not worked again, so the later B is never corrected.
+func TestRollbackWhileTheNewRevisionIsPending(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	revA := desired("api", 0x11, "uid-1")
+	revB := desired("api", 0x22, "uid-1")
+	keyA, keyB := p.revisionKey(revA), p.revisionKey(revB)
+	id := mustID(t, revA)
+
+	_ = p.Enqueue(revA)
+	if _, err := p.process(context.Background(), id); err != nil {
+		t.Fatalf("process A: %v", err)
+	}
+	c.setRecord(keyA, s.sign(t, p, revA))
+
+	// B is sent; its outcome is unknown and it has not mined yet.
+	_ = p.Enqueue(revB)
+	c.waitOut = WaitUnknown
+	sendsBefore := c.sends
+	if _, err := p.process(context.Background(), id); err == nil {
+		t.Fatal("unknown must not report success")
+	}
+	if c.sends != sendsBefore+1 {
+		t.Fatalf("setup: B was not sent: sends %d -> %d", sendsBefore, c.sends)
+	}
+
+	// Rollback to A while the chain still shows A.
+	_ = p.Enqueue(revA)
+	if _, err := p.process(context.Background(), id); err != nil {
+		t.Fatalf("process after rollback: %v", err)
+	}
+
+	// B mines now.
+	c.setRecord(keyB, s.sign(t, p, revB))
+	c.waitOut = WaitMinedSuccess
+
+	// The reconciler keeps observing A. Give it a bounded number of passes.
+	const passes = 3
+	preparesBefore := c.prepares
+	for i := 0; i < passes; i++ {
+		_ = p.Enqueue(revA)
+		if _, err := p.process(context.Background(), id); err != nil {
+			t.Fatalf("pass %d: %v", i, err)
+		}
+	}
+
+	if c.prepares == preparesBefore {
+		p.mu.Lock()
+		confirmed := p.state[id].confirmed
+		p.mu.Unlock()
+		t.Fatalf("chain holds B, Deployment is A, and A was not republished in %d passes "+
+			"(publisher confirmed A: %v)", passes, confirmed != nil && *confirmed == keyA)
+	}
+	last := c.prepared[len(c.prepared)-1].Hash()
+	if want := fmt.Sprintf("cfg%x", keyA.ConfigHash[0]); !strings.HasSuffix(last, want) {
+		t.Errorf("republished %s, want a transaction for A (%s)", last, want)
 	}
 }
 
