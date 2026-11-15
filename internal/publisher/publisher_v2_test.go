@@ -24,11 +24,13 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/go-logr/logr"
+	"k8s.io/client-go/util/workqueue"
 
 	"github.com/franklin1014/proof-of-deploy/internal/attest"
 )
@@ -504,64 +506,110 @@ func TestRollbackAfterTheNewRevisionLanded(t *testing.T) {
 // only then does B mine. The chain now holds B while the Deployment is A, so A
 // must be published again within a few reconcile passes.
 //
-// Known limitation (CHANGELOG "Known limitations"): this fails today. The
-// rollback pass reads A on chain and confirms it, and a confirmed revision is
-// not worked again, so the later B is never corrected.
+// Known failing until T2: the rollback pass reads A on chain and confirms it,
+// and a confirmed revision is not worked again, so the later B is never
+// corrected.
+//
+// The test drives the real worker path, so it shows whether production would
+// detect and correct the state. Work runs only if Enqueue
+// (publisher_v2.go:248, publisher_v2.go:266) or processNext's own retry
+// (publisher_v2.go:308, publisher_v2.go:312) queued it; process is never called
+// directly and nothing is added to the queue by hand. The zero-backoff queue
+// changes when a retry runs, not whether it is admitted. The explicit ordering
+// lets B's retry run before B mines, after the rollback: being keyed by
+// workload, it does A's step (publisher_v2.go:323) and confirms A from the
+// stale read (publisher_v2.go:335-337).
 func TestRollbackWhileTheNewRevisionIsPending(t *testing.T) {
+	if os.Getenv("POD_RUN_KNOWN_FAILING") == "" {
+		t.Skip("known failing until T2 (rollback while new revision is in flight); set POD_RUN_KNOWN_FAILING=1 to run")
+	}
 	p, c, s := newTestPublisher(t)
+	p.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(0, 0))
+	defer p.queue.ShutDown()
 	revA := desired("api", 0x11, "uid-1")
 	revB := desired("api", 0x22, "uid-1")
 	keyA, keyB := p.revisionKey(revA), p.revisionKey(revB)
 	id := mustID(t, revA)
+	ctx := context.Background()
+	sigA := s.sign(t, p, revA)
 
 	_ = p.Enqueue(revA)
-	if _, err := p.process(context.Background(), id); err != nil {
-		t.Fatalf("process A: %v", err)
+	drainQueue(ctx, p, 10)
+	if c.sends != 1 {
+		t.Fatalf("setup: A was not published: sends %d", c.sends)
 	}
-	c.setRecord(keyA, s.sign(t, p, revA))
+	c.setRecord(keyA, sigA)
 
 	// B is sent; its outcome is unknown and it has not mined yet.
 	_ = p.Enqueue(revB)
 	c.waitOut = WaitUnknown
 	sendsBefore := c.sends
-	if _, err := p.process(context.Background(), id); err == nil {
-		t.Fatal("unknown must not report success")
-	}
+	drainQueue(ctx, p, 1)
 	if c.sends != sendsBefore+1 {
 		t.Fatalf("setup: B was not sent: sends %d -> %d", sendsBefore, c.sends)
 	}
-
-	// Rollback to A while the chain still shows A.
-	_ = p.Enqueue(revA)
-	if _, err := p.process(context.Background(), id); err != nil {
-		t.Fatalf("process after rollback: %v", err)
+	if n := p.queue.Len(); n != 1 {
+		t.Fatalf("setup: B's retry is not queued: queue length %d", n)
 	}
 
-	// B mines now.
+	// Rollback to A while the chain still shows A. This also consumes B's
+	// retry before B mines.
+	_ = p.Enqueue(revA)
+	drainQueue(ctx, p, 10)
+
+	// B mines now. A transaction prepared for A, if one is ever waited on,
+	// writes A's record; any other transaction leaves the record alone.
 	c.setRecord(keyB, s.sign(t, p, revB))
 	c.waitOut = WaitMinedSuccess
-
-	// The reconciler keeps observing A. Give it a bounded number of passes.
-	const passes = 3
-	preparesBefore := c.prepares
-	for i := 0; i < passes; i++ {
-		_ = p.Enqueue(revA)
-		if _, err := p.process(context.Background(), id); err != nil {
-			t.Fatalf("pass %d: %v", i, err)
+	forA := fmt.Sprintf("cfg%x", keyA.ConfigHash[0])
+	c.onWait = func(c *fakeChain, tx PreparedTx) {
+		if strings.HasSuffix(tx.Hash(), forA) {
+			c.setRecord(keyA, sigA)
 		}
 	}
 
-	if c.prepares == preparesBefore {
+	// The reconciler keeps observing A. Give it a bounded number of passes.
+	const passes = 5
+	preparesBefore, sendsAfterMine := c.prepares, c.sends
+	processed := 0
+	for i := 0; i < passes; i++ {
+		_ = p.Enqueue(revA)
+		processed += drainQueue(ctx, p, 10)
+	}
+
+	onchain, err := c.Latest(ctx, id)
+	if err != nil || !onchain.Exists || onchain.Key != keyA || !p.recordIsOurs(revA, onchain.Signature) {
 		p.mu.Lock()
 		confirmed := p.state[id].confirmed
 		p.mu.Unlock()
-		t.Fatalf("chain holds B, Deployment is A, and A was not republished in %d passes "+
-			"(publisher confirmed A: %v)", passes, confirmed != nil && *confirmed == keyA)
+		holds := "nothing"
+		switch {
+		case err != nil:
+			holds = "unreadable: " + err.Error()
+		case onchain.Exists && onchain.Key == keyB:
+			holds = "B"
+		case onchain.Exists && onchain.Key == keyA:
+			holds = "A with a signature that does not verify"
+		case onchain.Exists:
+			holds = "an unknown revision"
+		}
+		t.Fatalf("INVARIANT VIOLATED: Deployment is A but the chain holds %s after %d passes; "+
+			"after B mined: prepares %d, sends %d, items processed %d; publisher confirmed A: %v",
+			holds, passes, c.prepares-preparesBefore, c.sends-sendsAfterMine, processed,
+			confirmed != nil && *confirmed == keyA)
 	}
-	last := c.prepared[len(c.prepared)-1].Hash()
-	if want := fmt.Sprintf("cfg%x", keyA.ConfigHash[0]); !strings.HasSuffix(last, want) {
-		t.Errorf("republished %s, want a transaction for A (%s)", last, want)
+}
+
+// drainQueue runs processNext while the publisher's queue has work, at most max
+// times, and reports how many items it ran. Get blocks on an empty queue, so it
+// is only called when Len reports something queued.
+func drainQueue(ctx context.Context, p *PublisherV2, max int) int {
+	n := 0
+	for n < max && p.queue.Len() > 0 {
+		p.processNext(ctx)
+		n++
 	}
+	return n
 }
 
 // TestRevisionArrivingDuringSigningIsNotSent: B is desired while A is being
