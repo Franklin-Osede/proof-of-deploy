@@ -430,7 +430,9 @@ Verify against the code before relying on this list.
 - `image` is a tag string, not a resolved digest, and the verifier does not
   warn about mutable tags yet (ADR 0001, Decision 4).
 - No manifest mode, and no PARTIAL result (ADR 0002, Decision 3).
-- Hardhat falls back to a live public RPC when `RPC_URL` is unset.
+- `RPC_URL` is shared by both Hardhat testnets; with it unset, `baseSepolia`
+  and `polygonAmoy` are not defined at all (no public fallback), so a deploy
+  fails with HH100 instead of reaching a third-party endpoint.
 
 `docs/adr/0001-hash-protocol-v2.md` and `docs/adr/0002-v2-encoding-and-verifier-contract.md`
 record the protocol design. ADR 0002 was amended during implementation, and

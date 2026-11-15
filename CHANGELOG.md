@@ -42,6 +42,10 @@ contract are not readable by this version.
   the weakness that motivated v2.
 
 ### Fixed
+- Hardhat no longer falls back to a public RPC (`sepolia.base.org`,
+  `rpc-amoy.polygon.technology`) when `RPC_URL` is unset. The `baseSepolia` and
+  `polygonAmoy` networks are now defined only when `RPC_URL` is set; otherwise
+  `--network` fails with HH100. `npx hardhat test` still needs no configuration.
 - A rollback to the last published state was dropped as already published,
   even while a newer revision was desired. If the newer revision's transaction
   has already mined when the rollback is processed, the rollback is now

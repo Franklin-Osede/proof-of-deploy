@@ -17,18 +17,18 @@ module.exports = {
     },
   },
   networks: {
-    // Base Sepolia testnet — chainId 84532. NO real funds.
-    baseSepolia: {
-      url: RPC_URL || "https://sepolia.base.org",
-      chainId: 84532,
-      accounts,
-    },
-    // Polygon Amoy testnet — chainId 80002. NO real funds.
-    polygonAmoy: {
-      url: RPC_URL || "https://rpc-amoy.polygon.technology",
-      chainId: 80002,
-      accounts,
-    },
+    // The testnets are defined only when RPC_URL is set. There is deliberately
+    // no public default: with RPC_URL unset, `--network baseSepolia` (or
+    // polygonAmoy) fails with HH100 "network doesn't exist" instead of silently
+    // sending signed transactions through a third-party endpoint nobody chose.
+    ...(RPC_URL
+      ? {
+          // Base Sepolia testnet — chainId 84532. NO real funds.
+          baseSepolia: { url: RPC_URL, chainId: 84532, accounts },
+          // Polygon Amoy testnet — chainId 80002. NO real funds.
+          polygonAmoy: { url: RPC_URL, chainId: 80002, accounts },
+        }
+      : {}),
     // The throwaway node started by hack/demo.sh, on whatever port it picked.
     // Defined only when DEMO_RPC_URL is set, so there is no default that could
     // silently reach some other node already listening on 8545.
