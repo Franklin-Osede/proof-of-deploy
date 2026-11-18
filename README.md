@@ -411,12 +411,6 @@ Verify against the code before relying on this list.
   is retried until restart or until the Deployment changes. This follows from
   the code but has not been reproduced in a test yet; that is the next piece of
   work. There is no fee bumping and no confirmation depth.
-- **Rollback while a transaction is pending.** If a Deployment is rolled back
-  while the newer revision's transaction has not mined, the chain can end up
-  holding the newer revision. The operator treats the rollback as already
-  published and does not correct it until it restarts or the Deployment changes
-  again. Reproduced with the publisher's test doubles; the test is not
-  committed yet and the bug is not fixed.
 - **`pod-verify` checks declared configuration, not convergence.** It does not
   read rollout status or `paused` (see
   [What PASS does not mean](#what-pass-does-not-mean)).

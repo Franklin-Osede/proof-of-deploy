@@ -159,6 +159,11 @@ type workloadState struct {
 	signature []byte
 	prepared  PreparedTx
 	confirmed *RevisionKey
+	// unsettled is set when a revision is superseded while its transaction may
+	// still mine. Until a transaction for the current revision mines, which
+	// settles every earlier nonce, confirmed is only what the last read showed,
+	// so the chain keeps being read.
+	unsettled bool
 }
 
 // NewV2 builds a publisher. The signer's public key is read and parsed once:
@@ -220,7 +225,8 @@ func (p *PublisherV2) recordIsOurs(d Desired, sig []byte) bool {
 // Enqueue records a desired revision. It never blocks and never signs, so the
 // reconcile loop pays nothing for it.
 //
-// A revision that is both desired and confirmed is dropped. Anything else
+// A revision that is both desired and confirmed is dropped, unless a superseded
+// transaction may still mine and change what the chain holds. Anything else
 // supersedes whatever was desired before for that workload, including any
 // attempt in flight for it.
 //
@@ -241,7 +247,7 @@ func (p *PublisherV2) Enqueue(d Desired) error {
 		p.state[workloadID] = st
 	}
 	if st.seq != 0 && st.key == key {
-		confirmed := st.confirmed != nil && *st.confirmed == key
+		confirmed := st.confirmed != nil && *st.confirmed == key && !st.unsettled
 		p.mu.Unlock()
 		if !confirmed {
 			// Already the desired revision; the existing attempt continues.
@@ -257,6 +263,11 @@ func (p *PublisherV2) Enqueue(d Desired) error {
 	// A new revision invalidates the old signature and the old transaction.
 	// Keeping either would risk publishing a superseded state.
 	st.signature = nil
+	if st.prepared != nil {
+		// The replaced revision's transaction may already be sent and can still
+		// mine after the chain has been read for the new one.
+		st.unsettled = true
+	}
 	st.prepared = nil
 	// What was confirmed described the chain before the revision now being
 	// replaced could be sent. It is no longer evidence of what the chain holds.
@@ -384,6 +395,7 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 			"deployment", rev.desired.Label,
 			"hashVersion", rev.desired.Version.String(),
 			"tx", prepared.Hash())
+		p.settle(id, rev.seq)
 		return p.confirm(id, rev), nil
 
 	case WaitReverted:
@@ -416,7 +428,7 @@ func (p *PublisherV2) snapshot(id [32]byte) (workloadState, bool) {
 	if !ok || st.seq == 0 {
 		return workloadState{}, false
 	}
-	if st.confirmed != nil && *st.confirmed == st.key {
+	if st.confirmed != nil && *st.confirmed == st.key && !st.unsettled {
 		return workloadState{}, false
 	}
 	return *st, true
@@ -492,5 +504,16 @@ func (p *PublisherV2) discardAttempt(id [32]byte, seq uint64) {
 	defer p.mu.Unlock()
 	if st, ok := p.state[id]; ok && st.seq == seq {
 		st.prepared = nil
+	}
+}
+
+// settle records that a transaction for the current revision mined. It took a
+// later nonce than anything sent for a superseded revision, so none of those
+// can still land after it.
+func (p *PublisherV2) settle(id [32]byte, seq uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if st, ok := p.state[id]; ok && st.seq == seq {
+		st.unsettled = false
 	}
 }

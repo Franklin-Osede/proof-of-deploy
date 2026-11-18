@@ -45,16 +45,16 @@ contract are not readable by this version.
 - A rollback to the last published state was dropped as already published,
   even while a newer revision was desired. If the newer revision's transaction
   has already mined when the rollback is processed, the rollback is now
-  republished. If that transaction is still pending, the problem remains: see
-  Known limitations.
+  republished.
+- Rolling back while the newer revision's transaction is still pending no
+  longer leaves the newer revision on chain for good. The rollback is still
+  confirmed from the older record, but the publisher keeps re-reading the chain
+  on each reconcile until a transaction for the current revision mines. If the
+  pending transaction mines first, the rollback is republished over it. The
+  record of the pending transaction is held in memory only, so a restart inside
+  that window loses it. Covered by `TestRollbackWhileTheNewRevisionIsPending`.
 
 ### Known limitations
-- Rolling back while the newer revision's transaction is still pending can
-  leave the newer revision on chain. The operator reads the older record,
-  treats the rollback as published, and does not correct it once the pending
-  transaction mines, until it restarts or the Deployment changes again.
-  Reproduced with the publisher's test doubles in a test that is not yet
-  committed; not fixed.
 - `pod-verify` checks the Deployment's declared configuration. It does not
   confirm that the running Pods have converged to it: it does not read rollout
   status or `paused`.

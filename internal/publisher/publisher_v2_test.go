@@ -24,7 +24,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -506,8 +505,8 @@ func TestRollbackAfterTheNewRevisionLanded(t *testing.T) {
 // only then does B mine. The chain now holds B while the Deployment is A, so A
 // must be published again within a few reconcile passes.
 //
-// Known failing until T2: the rollback pass reads A on chain and confirms it,
-// and a confirmed revision is not worked again, so the later B is never
+// Before T2 this failed: the rollback pass read A on chain and confirmed it,
+// and a confirmed revision was not worked again, so the later B was never
 // corrected.
 //
 // The test drives the real worker path, so it shows whether production would
@@ -520,9 +519,6 @@ func TestRollbackAfterTheNewRevisionLanded(t *testing.T) {
 // workload, it does A's step (publisher_v2.go:323) and confirms A from the
 // stale read (publisher_v2.go:335-337).
 func TestRollbackWhileTheNewRevisionIsPending(t *testing.T) {
-	if os.Getenv("POD_RUN_KNOWN_FAILING") == "" {
-		t.Skip("known failing until T2 (rollback while new revision is in flight); set POD_RUN_KNOWN_FAILING=1 to run")
-	}
 	p, c, s := newTestPublisher(t)
 	p.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(0, 0))
 	defer p.queue.ShutDown()
