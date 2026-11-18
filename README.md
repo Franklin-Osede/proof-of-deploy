@@ -410,11 +410,17 @@ Verify against the code before relying on this list.
 - **Stuck transactions.** A prepared transaction whose nonce is taken by another
   is retried until restart or until the Deployment changes. This follows from
   the code but has not been reproduced in a test yet; that is the next piece of
-  work. There is no fee bumping and no confirmation depth.
+  work. A sent transaction whose outcome stays unknown, including a superseded
+  one, is re-checked at capped backoff until restart and never replaced: its
+  revision is not prepared again while it is unresolved. There is no fee
+  bumping and no confirmation depth.
 - **`pod-verify` checks declared configuration, not convergence.** It does not
   read rollout status or `paused` (see
   [What PASS does not mean](#what-pass-does-not-mean)).
 - **Pending transactions do not survive a restart** and may be published twice.
+  This includes a superseded transaction during a rollback: if it mines after a
+  restart, the chain can hold the newer revision until the Deployment changes
+  again or the operator restarts.
 - **A failing pipeline looks healthy.** Readiness is `healthz.Ping`, and there
   are no metrics for pending work, signing or publication.
 - **Every Deployment in the cluster is attested**, including the operator's own

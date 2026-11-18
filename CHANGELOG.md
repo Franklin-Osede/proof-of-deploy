@@ -47,12 +47,16 @@ contract are not readable by this version.
   has already mined when the rollback is processed, the rollback is now
   republished.
 - Rolling back while the newer revision's transaction is still pending no
-  longer leaves the newer revision on chain for good. The rollback is still
-  confirmed from the older record, but the publisher keeps re-reading the chain
-  on each reconcile until a transaction for the current revision mines. If the
-  pending transaction mines first, the rollback is republished over it. The
-  record of the pending transaction is held in memory only, so a restart inside
-  that window loses it. Covered by `TestRollbackWhileTheNewRevisionIsPending`.
+  longer leaves the newer revision on chain. The publisher keeps every sent
+  transaction whose outcome it has not observed, including superseded ones, and
+  re-checks them through its own rate-limited retry, without waiting for
+  another reconcile, until each one's receipt reports mined or reverted. When
+  one lands it reads the chain again and republishes the current revision if
+  needed. A revision is never prepared again while an earlier transaction for
+  it is unresolved; that transaction is resent instead. No nonce ordering is
+  assumed. Covered by `TestRollbackWhileTheNewRevisionIsPending`,
+  `TestRollbackRecoversWithoutFurtherEnqueue`, `TestRollbackFlapPublishesOnce`
+  and `TestRollbackWithUnresolvedTxDoesNotRepublish`.
 
 ### Known limitations
 - `pod-verify` checks the Deployment's declared configuration. It does not
@@ -60,7 +64,13 @@ contract are not readable by this version.
   status or `paused`.
 - A prepared transaction whose nonce is taken by another transaction is retried
   until the operator restarts or the Deployment changes. Not yet reproduced in a
-  test; tracked as the next piece of work.
+  test; tracked as the next piece of work. More generally, a sent transaction
+  whose outcome stays unknown, including a superseded one, is re-checked at
+  capped backoff until restart and never replaced: its revision is not prepared
+  again while it is unresolved.
+- The record of unresolved transactions is held in memory only. After a
+  restart during a rollback, a superseded transaction that mines later is not
+  corrected until the Deployment changes again or the operator restarts.
 - Literal environment variable values, referenced ConfigMap and Secret
   contents, and the bytes behind an image tag are not hashed. See the README.
 

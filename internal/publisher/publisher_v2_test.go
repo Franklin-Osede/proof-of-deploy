@@ -511,13 +511,13 @@ func TestRollbackAfterTheNewRevisionLanded(t *testing.T) {
 //
 // The test drives the real worker path, so it shows whether production would
 // detect and correct the state. Work runs only if Enqueue
-// (publisher_v2.go:248, publisher_v2.go:266) or processNext's own retry
-// (publisher_v2.go:308, publisher_v2.go:312) queued it; process is never called
+// (publisher_v2.go:275, publisher_v2.go:302) or processNext's own retry
+// (publisher_v2.go:344, publisher_v2.go:348) queued it; process is never called
 // directly and nothing is added to the queue by hand. The zero-backoff queue
 // changes when a retry runs, not whether it is admitted. The explicit ordering
 // lets B's retry run before B mines, after the rollback: being keyed by
-// workload, it does A's step (publisher_v2.go:323) and confirms A from the
-// stale read (publisher_v2.go:335-337).
+// workload, it does A's step (publisher_v2.go:359) and confirms A from the
+// stale read (publisher_v2.go:380-385).
 func TestRollbackWhileTheNewRevisionIsPending(t *testing.T) {
 	p, c, s := newTestPublisher(t)
 	p.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(0, 0))
@@ -891,5 +891,218 @@ func TestNewV2RejectsAnUnparseableSignerKey(t *testing.T) {
 	bad := &fakeSigner{der: []byte("not a DER public key")}
 	if _, err := NewV2(bad, &fakeChain{}, logr.Discard()); err == nil {
 		t.Fatal("a signer whose public key cannot be parsed was accepted")
+	}
+}
+
+// --- rollback while a transaction is unresolved ------------------------------
+//
+// These drive the real worker path the way TestRollbackWhileTheNewRevisionIsPending
+// does: work runs only if Enqueue or processNext's own retry queued it, on a
+// queue whose backoff is zero. The zero backoff changes when a retry runs, not
+// whether it is admitted.
+
+// TestRollbackRecoversWithoutFurtherEnqueue: A is on chain, B is sent with an
+// unknown outcome, the Deployment returns to A, and B mines afterwards. The
+// reconciler enqueues only on Deployment events, so after B mines nothing is
+// enqueued at all. The publisher must still put A back on chain, and then stop.
+func TestRollbackRecoversWithoutFurtherEnqueue(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	p.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(0, 0))
+	defer p.queue.ShutDown()
+	revA := desired("api", 0x11, "uid-1")
+	revB := desired("api", 0x22, "uid-1")
+	keyA, keyB := p.revisionKey(revA), p.revisionKey(revB)
+	id := mustID(t, revA)
+	ctx := context.Background()
+	sigA := s.sign(t, p, revA)
+
+	_ = p.Enqueue(revA)
+	drainQueue(ctx, p, 10)
+	if c.sends != 1 {
+		t.Fatalf("setup: A was not published: sends %d", c.sends)
+	}
+	c.setRecord(keyA, sigA)
+
+	// B is sent; its outcome is unknown and it has not mined yet.
+	_ = p.Enqueue(revB)
+	c.waitOut = WaitUnknown
+	drainQueue(ctx, p, 1)
+	if c.sends != 2 {
+		t.Fatalf("setup: B was not sent: sends %d", c.sends)
+	}
+	if n := p.queue.Len(); n != 1 {
+		t.Fatalf("setup: B's retry is not queued: queue length %d", n)
+	}
+
+	// Rollback while the chain still shows A. B's retry runs here, before B
+	// mines, and A is confirmed from that stale read.
+	_ = p.Enqueue(revA)
+	drainQueue(ctx, p, 10)
+
+	// B mines. A transaction for A writes A's record when waited on.
+	c.setRecord(keyB, s.sign(t, p, revB))
+	c.waitOut = WaitMinedSuccess
+	forA := fmt.Sprintf("cfg%x", keyA.ConfigHash[0])
+	c.onWait = func(c *fakeChain, tx PreparedTx) {
+		if strings.HasSuffix(tx.Hash(), forA) {
+			c.setRecord(keyA, sigA)
+		}
+	}
+
+	// No Enqueue from here on: only what the publisher queued itself runs.
+	const rounds, perRound = 5, 10
+	holdsA := func() bool {
+		oc, err := c.Latest(ctx, id)
+		return err == nil && oc.Exists && oc.Key == keyA && p.recordIsOurs(revA, oc.Signature)
+	}
+	processed := 0
+	for i := 0; i < rounds && !holdsA(); i++ {
+		processed += drainQueue(ctx, p, perRound)
+	}
+	if !holdsA() {
+		oc, _ := c.Latest(ctx, id)
+		t.Fatalf("LIVENESS VIOLATED: Deployment is A but after B mined the chain holds B=%v "+
+			"with no further Enqueue; items processed %d, queue length %d",
+			oc.Exists && oc.Key == keyB, processed, p.queue.Len())
+	}
+
+	// Everything is resolved, so the retries must stop.
+	for i := 0; i < rounds && p.queue.Len() > 0; i++ {
+		drainQueue(ctx, p, perRound)
+	}
+	if n := p.queue.Len(); n != 0 {
+		t.Fatalf("NO TERMINATION: the chain holds A and nothing is unresolved, but the queue still has %d item(s) after %d rounds",
+			n, rounds)
+	}
+}
+
+// TestRollbackFlapPublishesOnce: A1 is sent (unknown), B1 is sent (unknown),
+// and the Deployment returns to A. A1 mines while A's attempt is waited on,
+// then B1 mines. Exactly one transaction may be live for A at a time: the
+// earlier A attempt is still unresolved when A is desired again, so it is
+// reused rather than replaced, and a new one is prepared only after B
+// overwrote A on chain and A's earlier attempt was observed to settle.
+func TestRollbackFlapPublishesOnce(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	p.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(0, 0))
+	defer p.queue.ShutDown()
+	revA := desired("api", 0x11, "uid-1")
+	revB := desired("api", 0x22, "uid-1")
+	keyA, keyB := p.revisionKey(revA), p.revisionKey(revB)
+	id := mustID(t, revA)
+	ctx := context.Background()
+	sigA := s.sign(t, p, revA)
+	forA := fmt.Sprintf("cfg%x", keyA.ConfigHash[0])
+	isA := func(tx PreparedTx) bool { return strings.HasSuffix(tx.Hash(), forA) }
+
+	c.waitOut = WaitUnknown
+	_ = p.Enqueue(revA)
+	drainQueue(ctx, p, 1)
+	if c.prepares != 1 || c.sends != 1 {
+		t.Fatalf("setup: A1 was not sent: prepares %d sends %d", c.prepares, c.sends)
+	}
+	txA1 := c.prepared[0]
+
+	_ = p.Enqueue(revB)
+	drainQueue(ctx, p, 1)
+	if c.prepares != 2 || c.sends != 2 {
+		t.Fatalf("setup: B1 was not sent: prepares %d sends %d", c.prepares, c.sends)
+	}
+
+	// Back to A. While a transaction for A is being waited on, A1 mines. A
+	// transaction mines once, so A1 writes A's record exactly once.
+	a1Mined := false
+	c.onWait = func(c *fakeChain, tx PreparedTx) {
+		if isA(tx) && !a1Mined {
+			a1Mined = true
+			c.setRecord(keyA, sigA)
+		}
+	}
+	preparedBeforeSecondA := c.prepares
+	_ = p.Enqueue(revA)
+	drainQueue(ctx, p, 10)
+
+	// B1 mines after A1. Every transaction waited on from here reports mined.
+	// A1 has already mined and does not write again; any other transaction
+	// for A writes A's record when it mines.
+	c.setRecord(keyB, s.sign(t, p, revB))
+	c.waitOut = WaitMinedSuccess
+	c.onWait = func(c *fakeChain, tx PreparedTx) {
+		if isA(tx) && tx.Hash() != txA1.Hash() {
+			c.setRecord(keyA, sigA)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		_ = p.Enqueue(revA)
+		drainQueue(ctx, p, 10)
+	}
+
+	var newA []string
+	for _, tx := range c.prepared[preparedBeforeSecondA:] {
+		if isA(tx) {
+			newA = append(newA, tx.Hash())
+		}
+	}
+	oc, err := c.Latest(ctx, id)
+	holdsA := err == nil && oc.Exists && oc.Key == keyA && p.recordIsOurs(revA, oc.Signature)
+	if len(newA) > 1 || !holdsA {
+		t.Fatalf("DUPLICATE PUBLICATION: %d transactions prepared for the second desired A %v, want at most 1 "+
+			"(A1 %s was unresolved when A was desired again); chain holds A: %v",
+			len(newA), newA, txA1.Hash(), holdsA)
+	}
+}
+
+// TestRollbackWithUnresolvedTxDoesNotRepublish: the Deployment returns to A
+// while B's transaction is unknown, and B never mines: the chain keeps showing
+// A. Nothing may be published for A, B must not be resent, and B's handle
+// must not be dropped: it keeps being checked.
+func TestRollbackWithUnresolvedTxDoesNotRepublish(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	p.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(0, 0))
+	defer p.queue.ShutDown()
+	revA := desired("api", 0x11, "uid-1")
+	revB := desired("api", 0x22, "uid-1")
+	keyA := p.revisionKey(revA)
+	id := mustID(t, revA)
+	ctx := context.Background()
+
+	_ = p.Enqueue(revA)
+	drainQueue(ctx, p, 10)
+	if c.sends != 1 {
+		t.Fatalf("setup: A was not published: sends %d", c.sends)
+	}
+	c.setRecord(keyA, s.sign(t, p, revA))
+
+	_ = p.Enqueue(revB)
+	c.waitOut = WaitUnknown
+	drainQueue(ctx, p, 1)
+	if c.sends != 2 {
+		t.Fatalf("setup: B was not sent: sends %d", c.sends)
+	}
+	txB := c.prepared[len(c.prepared)-1]
+
+	var waited []string
+	c.onWait = func(_ *fakeChain, tx PreparedTx) { waited = append(waited, tx.Hash()) }
+
+	preparesAtRollback, sendsAtRollback := c.prepares, c.sends
+	const rounds = 20
+	checkedB := false
+	for i := 0; i < rounds; i++ {
+		waited = waited[:0]
+		_ = p.Enqueue(revA)
+		drainQueue(ctx, p, 10)
+		checkedB = false
+		for _, h := range waited {
+			checkedB = checkedB || h == txB.Hash()
+		}
+	}
+
+	oc, err := c.Latest(ctx, id)
+	holdsA := err == nil && oc.Exists && oc.Key == keyA
+	if c.prepares != preparesAtRollback || c.sends != sendsAtRollback || !checkedB || p.queue.Len() == 0 || !holdsA {
+		t.Fatalf("UNRESOLVED TX VIOLATED: after %d rounds with B unknown: prepares %d -> %d, sends %d -> %d, "+
+			"B (%s) re-checked in the last round: %v, re-check still queued: %v, chain holds A: %v",
+			rounds, preparesAtRollback, c.prepares, sendsAtRollback, c.sends,
+			txB.Hash(), checkedB, p.queue.Len() > 0, holdsA)
 	}
 }
