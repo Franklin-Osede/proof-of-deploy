@@ -416,16 +416,17 @@ Verify against the code before relying on this list.
   revision is not prepared again while it is unresolved. There is no fee
   bumping and no confirmation depth.
 - **The list of unresolved transactions has no cap.** A cap would drop a
-  transaction whose outcome is unknown. The list only grows with transactions
-  that never settle (dropped from the mempool, nonce taken), which is the
-  stuck-transaction gap above. Every retained transaction is waited on in each
-  pass, and with the real chain adapter a pending one can hold the single
+  transaction whose outcome is unknown. It holds every sent transaction still
+  waiting for a receipt: a slow one until it settles, and one that never settles
+  (dropped from the mempool, nonce taken) until restart, which is the
+  stuck-transaction gap above. Retained transactions are waited on again on
+  every retry, and with the real chain adapter a pending one can hold the single
   publisher worker for up to the publish timeout.
 - **Chain reads are assumed to be up to date.** After a receipt is returned,
   the publisher assumes the next read of the record reflects it. That holds on a
-  single node. A load-balanced RPC endpoint can serve a stale read, and a
-  rollback decided on it can stay uncorrected until the next event for that
-  Deployment.
+  single node without a chain reorganisation. A load-balanced RPC endpoint can
+  serve a stale read, and a rollback decided on it can stay uncorrected until
+  something triggers a fresh check, such as the next change to that Deployment.
 - **`pod-verify` checks declared configuration, not convergence.** It does not
   read rollout status or `paused` (see
   [What PASS does not mean](#what-pass-does-not-mean)).

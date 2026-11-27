@@ -78,14 +78,16 @@ contract are not readable by this version.
   capped backoff until restart and never replaced: its revision is not prepared
   again while it is unresolved.
 - The list of unresolved transactions has no cap: a cap would drop a
-  transaction whose outcome is unknown. It only grows with transactions that
-  never settle (dropped from the mempool, nonce taken). Every retained one is
-  waited on in each pass, and with the real chain adapter a pending one can hold
-  the single publisher worker for up to the publish timeout.
+  transaction whose outcome is unknown. It holds every sent transaction still
+  waiting for a receipt: a slow one until it settles, and one that never settles
+  (dropped from the mempool, nonce taken) until restart. Retained transactions
+  are waited on again on every retry, and with the real chain adapter a pending
+  one can hold the single publisher worker for up to the publish timeout.
 - The publisher assumes a chain read reflects a write whose receipt was already
-  returned. That holds on a single node; a load-balanced RPC endpoint can serve
-  a stale read, and a rollback decided on it can stay uncorrected until the next
-  event for that Deployment.
+  returned. That holds on a single node without a chain reorganisation; a
+  load-balanced RPC endpoint can serve a stale read, and a rollback decided on it
+  can stay uncorrected until something triggers a fresh check, such as the next
+  change to that Deployment.
 - The record of unresolved transactions is held in memory only. After a
   restart during a rollback, a superseded transaction that mines later is not
   corrected until the Deployment changes again or the operator restarts.
