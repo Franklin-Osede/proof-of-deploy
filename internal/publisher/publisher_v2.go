@@ -44,8 +44,9 @@ import (
 //   - Unknown keeps the attempt. Preparing a replacement would take a fresh
 //     nonce and publish twice.
 //   - Reverted discards the attempt; it definitively did not take effect.
-//   - Mined-success confirms. So does a matching on-chain record, which is how
-//     a lost receipt is recovered.
+//   - Mined-success confirms, unless another of our transactions landed while
+//     it was unresolved; then only a chain read does. A matching on-chain
+//     record also confirms, which is how a lost receipt is recovered.
 //   - A newer revision invalidates the older one, and no in-flight worker may
 //     confirm or publish on behalf of a revision that is no longer desired.
 //   - A confirmation is only trusted until a different revision is desired.
@@ -55,6 +56,11 @@ import (
 //     transaction cannot be recalled.
 //   - The chain is queried before the first Prepare, always. That is also what
 //     recovers state after a restart, when every attempt in memory is gone.
+//
+// Assumption: Latest sees a write whose receipt has already been returned.
+// That holds on a single node. A load-balanced RPC endpoint can serve a stale
+// read, and a rollback decided on it can stay uncorrected until the next event
+// for that workload.
 type PublisherV2 struct {
 	queue  workqueue.RateLimitingInterface
 	signer Signer
@@ -410,14 +416,18 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 	}
 
 	sent, err := p.chain.Send(ctx, prepared)
-	if err != nil {
+	switch {
+	case err != nil && fresh:
 		// Nothing was sent; this is a fault, not uncertainty.
-		if fresh {
-			p.unmarkSent(id, prepared)
-		}
+		p.unmarkSent(id, prepared)
 		return false, fmt.Errorf("sending publish: %w", err)
-	}
-	if sent == SendUnknown {
+	case err != nil:
+		// It was sent on an earlier pass, so the error means nothing was sent
+		// THIS time, not that nothing ever was. The node may no longer hold it
+		// because it already mined. Its receipt is what settles it, so wait.
+		p.log.Info("resending an already sent transaction failed; reading its receipt",
+			"deployment", rev.desired.Label, "tx", prepared.Hash(), "error", err.Error())
+	case sent == SendUnknown:
 		// "Already known" reports unknown too, so the transaction may well be
 		// at the node. Waiting is correct; assuming nothing happened is what
 		// causes a second nonce and a second publication.

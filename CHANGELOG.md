@@ -57,17 +57,35 @@ contract are not readable by this version.
   assumed. Covered by `TestRollbackWhileTheNewRevisionIsPending`,
   `TestRollbackRecoversWithoutFurtherEnqueue`, `TestRollbackFlapPublishesOnce`
   and `TestRollbackWithUnresolvedTxDoesNotRepublish`.
+- A rollback could stall forever when resending the earlier, still unresolved
+  transaction for the same revision failed with "nothing was sent" (for
+  example because it had already mined). The publisher returned before reading
+  that transaction's receipt, on every pass. A send error now aborts the pass
+  only for a transaction's first send; for one already sent, the error is
+  logged and its receipt is read as usual, so it settles and recovery
+  continues without another reconcile. Covered by
+  `TestResendFaultStillReadsTheReceipt`.
 
 ### Known limitations
 - `pod-verify` checks the Deployment's declared configuration. It does not
   confirm that the running Pods have converged to it: it does not read rollout
   status or `paused`.
-- A prepared transaction whose nonce is taken by another transaction is retried
-  until the operator restarts or the Deployment changes. Not yet reproduced in a
-  test; tracked as the next piece of work. More generally, a sent transaction
+- A prepared transaction whose nonce is taken by another transaction is resent
+  while its revision is desired; once superseded it is no longer resent, but its
+  receipt keeps being checked until the operator restarts. Not yet reproduced in
+  a test; tracked as the next piece of work. More generally, a sent transaction
   whose outcome stays unknown, including a superseded one, is re-checked at
   capped backoff until restart and never replaced: its revision is not prepared
   again while it is unresolved.
+- The list of unresolved transactions has no cap: a cap would drop a
+  transaction whose outcome is unknown. It only grows with transactions that
+  never settle (dropped from the mempool, nonce taken). Every retained one is
+  waited on in each pass, and with the real chain adapter a pending one can hold
+  the single publisher worker for up to the publish timeout.
+- The publisher assumes a chain read reflects a write whose receipt was already
+  returned. That holds on a single node; a load-balanced RPC endpoint can serve
+  a stale read, and a rollback decided on it can stay uncorrected until the next
+  event for that Deployment.
 - The record of unresolved transactions is held in memory only. After a
   restart during a rollback, a superseded transaction that mines later is not
   corrected until the Deployment changes again or the operator restarts.

@@ -111,6 +111,11 @@ type fakeChain struct {
 	waitOut   WaitOutcome
 	onWait    func(c *fakeChain, p PreparedTx)
 	sendErr   error
+
+	// waitFor, when set, decides the outcome of each Wait instead of waitOut.
+	waitFor func(PreparedTx) WaitOutcome
+	// sendErrFor, when set, decides each Send's error instead of sendErr.
+	sendErrFor func(PreparedTx) error
 }
 
 func (c *fakeChain) Latest(_ context.Context, _ [32]byte) (OnChain, error) {
@@ -137,14 +142,18 @@ func (c *fakeChain) Prepare(_ context.Context, _ [32]byte, key RevisionKey, sig 
 	return tx, nil
 }
 
-func (c *fakeChain) Send(_ context.Context, _ PreparedTx) (SendOutcome, error) {
+func (c *fakeChain) Send(_ context.Context, p PreparedTx) (SendOutcome, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.sends++
-	if c.sendErr != nil {
-		return SendUnknown, c.sendErr
+	errFor, err, out := c.sendErrFor, c.sendErr, c.sendOut
+	c.mu.Unlock()
+	if errFor != nil {
+		err = errFor(p)
 	}
-	return c.sendOut, nil
+	if err != nil {
+		return SendUnknown, err
+	}
+	return out, nil
 }
 
 func (c *fakeChain) Wait(_ context.Context, p PreparedTx) (WaitOutcome, error) {
@@ -152,7 +161,11 @@ func (c *fakeChain) Wait(_ context.Context, p PreparedTx) (WaitOutcome, error) {
 	c.waits++
 	hook := c.onWait
 	out := c.waitOut
+	waitFor := c.waitFor
 	c.mu.Unlock()
+	if waitFor != nil {
+		out = waitFor(p)
+	}
 	if hook != nil {
 		hook(c, p)
 	}
@@ -977,11 +990,11 @@ func TestRollbackRecoversWithoutFurtherEnqueue(t *testing.T) {
 }
 
 // TestRollbackFlapPublishesOnce: A1 is sent (unknown), B1 is sent (unknown),
-// and the Deployment returns to A. A1 mines while A's attempt is waited on,
-// then B1 mines. Exactly one transaction may be live for A at a time: the
-// earlier A attempt is still unresolved when A is desired again, so it is
-// reused rather than replaced, and a new one is prepared only after B
-// overwrote A on chain and A's earlier attempt was observed to settle.
+// and the Deployment returns to A. Exactly one transaction may be live for A at
+// a time: A1 is still unresolved when A is desired again, so it is reused
+// rather than replaced. Phase 1 checks that while nothing mines; phase 2 lets
+// A1 mine and then B1 over it, after which at most one new A transaction may be
+// prepared and the chain must end on A.
 func TestRollbackFlapPublishesOnce(t *testing.T) {
 	p, c, s := newTestPublisher(t)
 	p.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(0, 0))
@@ -994,6 +1007,10 @@ func TestRollbackFlapPublishesOnce(t *testing.T) {
 	sigA := s.sign(t, p, revA)
 	forA := fmt.Sprintf("cfg%x", keyA.ConfigHash[0])
 	isA := func(tx PreparedTx) bool { return strings.HasSuffix(tx.Hash(), forA) }
+	duplicate := func(format string, args ...any) {
+		t.Helper()
+		t.Fatalf("DUPLICATE PUBLICATION: "+format, args...)
+	}
 
 	c.waitOut = WaitUnknown
 	_ = p.Enqueue(revA)
@@ -1008,29 +1025,38 @@ func TestRollbackFlapPublishesOnce(t *testing.T) {
 	if c.prepares != 2 || c.sends != 2 {
 		t.Fatalf("setup: B1 was not sent: prepares %d sends %d", c.prepares, c.sends)
 	}
+	txB1 := c.prepared[1]
 
-	// Back to A. While a transaction for A is being waited on, A1 mines. A
-	// transaction mines once, so A1 writes A's record exactly once.
-	a1Mined := false
-	c.onWait = func(c *fakeChain, tx PreparedTx) {
-		if isA(tx) && !a1Mined {
-			a1Mined = true
-			c.setRecord(keyA, sigA)
-		}
-	}
+	// Phase 1: back to A. Nothing mines and every wait is unknown, so A1 is
+	// unresolved throughout and no other A transaction may be prepared.
 	preparedBeforeSecondA := c.prepares
 	_ = p.Enqueue(revA)
 	drainQueue(ctx, p, 10)
+	if c.prepares != preparedBeforeSecondA {
+		duplicate("prepares %d -> %d while A1 %s was unresolved; prepared %v",
+			preparedBeforeSecondA, c.prepares, txA1.Hash(), c.prepared[preparedBeforeSecondA:])
+	}
 
-	// B1 mines after A1. Every transaction waited on from here reports mined.
-	// A1 has already mined and does not write again; any other transaction
-	// for A writes A's record when it mines.
-	c.setRecord(keyB, s.sign(t, p, revB))
-	c.waitOut = WaitMinedSuccess
-	c.onWait = func(c *fakeChain, tx PreparedTx) {
-		if isA(tx) && tx.Hash() != txA1.Hash() {
+	// Phase 2: A1 mines, writing A's record once on its first mined wait. B1
+	// mines after it, over A: it stays unknown until A1 has mined, then writes
+	// B. Any later A transaction writes A's record when it mines.
+	a1Mined := false
+	c.waitFor = func(tx PreparedTx) WaitOutcome {
+		switch {
+		case tx.Hash() == txA1.Hash():
+			if !a1Mined {
+				a1Mined = true
+				c.setRecord(keyA, sigA)
+			}
+		case tx.Hash() == txB1.Hash():
+			if !a1Mined {
+				return WaitUnknown
+			}
+			c.setRecord(keyB, s.sign(t, p, revB))
+		case isA(tx):
 			c.setRecord(keyA, sigA)
 		}
+		return WaitMinedSuccess
 	}
 	for i := 0; i < 5; i++ {
 		_ = p.Enqueue(revA)
@@ -1046,7 +1072,7 @@ func TestRollbackFlapPublishesOnce(t *testing.T) {
 	oc, err := c.Latest(ctx, id)
 	holdsA := err == nil && oc.Exists && oc.Key == keyA && p.recordIsOurs(revA, oc.Signature)
 	if len(newA) > 1 || !holdsA {
-		t.Fatalf("DUPLICATE PUBLICATION: %d transactions prepared for the second desired A %v, want at most 1 "+
+		duplicate("%d transactions prepared for the second desired A %v, want at most 1 "+
 			"(A1 %s was unresolved when A was desired again); chain holds A: %v",
 			len(newA), newA, txA1.Hash(), holdsA)
 	}
@@ -1087,9 +1113,11 @@ func TestRollbackWithUnresolvedTxDoesNotRepublish(t *testing.T) {
 	preparesAtRollback, sendsAtRollback := c.prepares, c.sends
 	const rounds = 20
 	checkedB := false
+	// The rollback is enqueued once. Every later round only drains, so any
+	// work it finds was queued by the publisher's own retry.
+	_ = p.Enqueue(revA)
 	for i := 0; i < rounds; i++ {
 		waited = waited[:0]
-		_ = p.Enqueue(revA)
 		drainQueue(ctx, p, 10)
 		checkedB = false
 		for _, h := range waited {
@@ -1104,5 +1132,86 @@ func TestRollbackWithUnresolvedTxDoesNotRepublish(t *testing.T) {
 			"B (%s) re-checked in the last round: %v, re-check still queued: %v, chain holds A: %v",
 			rounds, preparesAtRollback, c.prepares, sendsAtRollback, c.sends,
 			txB.Hash(), checkedB, p.queue.Len() > 0, holdsA)
+	}
+}
+
+// TestResendFaultStillReadsTheReceipt: A1 is sent (unknown), B1 is sent
+// (unknown), and the Deployment returns to A, which adopts A1. Then both have
+// mined, A1 first and B1 over it, so the chain holds B. The node no longer
+// accepts A1, so every resend of it fails with "nothing was sent". That error
+// says nothing about the earlier send: A1's receipt must still be read, after
+// which exactly one new A transaction puts A back, without any further Enqueue.
+func TestResendFaultStillReadsTheReceipt(t *testing.T) {
+	p, c, s := newTestPublisher(t)
+	p.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(0, 0))
+	defer p.queue.ShutDown()
+	revA := desired("api", 0x11, "uid-1")
+	revB := desired("api", 0x22, "uid-1")
+	keyA, keyB := p.revisionKey(revA), p.revisionKey(revB)
+	id := mustID(t, revA)
+	ctx := context.Background()
+	sigA := s.sign(t, p, revA)
+	forA := fmt.Sprintf("cfg%x", keyA.ConfigHash[0])
+	isA := func(tx PreparedTx) bool { return strings.HasSuffix(tx.Hash(), forA) }
+
+	c.waitOut = WaitUnknown
+	_ = p.Enqueue(revA)
+	drainQueue(ctx, p, 1)
+	if c.prepares != 1 || c.sends != 1 {
+		t.Fatalf("setup: A1 was not sent: prepares %d sends %d", c.prepares, c.sends)
+	}
+	txA1 := c.prepared[0]
+	_ = p.Enqueue(revB)
+	drainQueue(ctx, p, 1)
+	if c.prepares != 2 || c.sends != 2 {
+		t.Fatalf("setup: B1 was not sent: prepares %d sends %d", c.prepares, c.sends)
+	}
+
+	// The last Enqueue: A is desired again and adopts A1.
+	_ = p.Enqueue(revA)
+	p.mu.Lock()
+	adopted := p.state[id].prepared
+	p.mu.Unlock()
+	if adopted == nil || adopted.Hash() != txA1.Hash() {
+		t.Fatalf("setup: A1 was not adopted as A's attempt: %v", adopted)
+	}
+
+	c.setRecord(keyB, s.sign(t, p, revB))
+	resendFailed, receiptAfterFault := false, false
+	c.sendErrFor = func(tx PreparedTx) error {
+		if tx.Hash() == txA1.Hash() {
+			resendFailed = true
+			return errors.New("no transaction was sent")
+		}
+		return nil
+	}
+	c.waitFor = func(tx PreparedTx) WaitOutcome {
+		switch {
+		case tx.Hash() == txA1.Hash():
+			receiptAfterFault = receiptAfterFault || resendFailed
+		case isA(tx):
+			c.setRecord(keyA, sigA)
+		}
+		return WaitMinedSuccess
+	}
+	preparesBefore := c.prepares
+
+	const rounds, perRound = 5, 10
+	for i := 0; i < rounds && p.queue.Len() > 0; i++ {
+		drainQueue(ctx, p, perRound)
+	}
+
+	var newA []string
+	for _, tx := range c.prepared[preparesBefore:] {
+		if isA(tx) {
+			newA = append(newA, tx.Hash())
+		}
+	}
+	oc, err := c.Latest(ctx, id)
+	holdsA := err == nil && oc.Exists && oc.Key == keyA && p.recordIsOurs(revA, oc.Signature)
+	if !receiptAfterFault || len(newA) != 1 || !holdsA {
+		t.Fatalf("RESEND FAULT: A1 %s resend failed: %v, receipt read after that: %v; "+
+			"new A transactions %v, want exactly 1; chain holds A: %v; queue length %d",
+			txA1.Hash(), resendFailed, receiptAfterFault, newA, holdsA, p.queue.Len())
 	}
 }

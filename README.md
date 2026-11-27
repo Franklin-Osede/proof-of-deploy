@@ -217,7 +217,7 @@ and redistributing its address to every consumer.
 | Two replicas, `--leader-elect` | Only the leader publishes. `config/manager/manager.yaml` runs one replica with `--leader-elect` set. |
 | Two replicas, no leader election | Both observe, sign, and publish: duplicate gas and nonce contention. The binary defaults to `--leader-elect=false`; safety depends on the entry point. |
 | KMS throttled or IAM denied | Retried with 1s–5m backoff, indefinitely. **Liveness and readiness stay green.** A permanently broken attestor looks healthy. |
-| RPC down / tx not mined | A publication counts only once its receipt is mined. A send whose outcome is unknown keeps the same signed transaction and resends those exact bytes; a reverted one is rebuilt. Known gap: if another transaction takes the prepared transaction's nonce, that attempt is retried until restart or until the Deployment changes. There is no fee bumping and no confirmation depth. |
+| RPC down / tx not mined | A publication counts only once its receipt is mined. A send whose outcome is unknown keeps the same signed transaction and resends those exact bytes; a reverted one is rebuilt. Known gap: if another transaction takes the prepared transaction's nonce, that attempt is resent while its revision is desired; once superseded it is no longer resent, but its receipt keeps being checked until restart. There is no fee bumping and no confirmation depth. |
 | Deployment deleted | No tombstone is written. The on-chain `latest` record persists forever. |
 | Deployment recreated, same namespace/name | The new object has a new UID, so the old record no longer matches: `pod-verify` reports an incarnation-mismatch `FAIL` until the new incarnation is attested. |
 | Config changed but hash-stable | Changing a literal env value (including one expanded into `command`/`args` via `$(VAR)`), the contents of a referenced ConfigMap or Secret, or what an image tag points at leaves the hash unchanged. `PASS` persists. See [What is hashed](#what-is-hashed-protocol-v2). |
@@ -408,12 +408,24 @@ Verify against the code before relying on this list.
 - **No freshness or ordering.** Whoever holds the publisher account can re-post
   an older, validly signed record.
 - **Stuck transactions.** A prepared transaction whose nonce is taken by another
-  is retried until restart or until the Deployment changes. This follows from
+  is resent while its revision is desired; once superseded it is no longer
+  resent, but its receipt keeps being checked until restart. This follows from
   the code but has not been reproduced in a test yet; that is the next piece of
   work. A sent transaction whose outcome stays unknown, including a superseded
   one, is re-checked at capped backoff until restart and never replaced: its
   revision is not prepared again while it is unresolved. There is no fee
   bumping and no confirmation depth.
+- **The list of unresolved transactions has no cap.** A cap would drop a
+  transaction whose outcome is unknown. The list only grows with transactions
+  that never settle (dropped from the mempool, nonce taken), which is the
+  stuck-transaction gap above. Every retained transaction is waited on in each
+  pass, and with the real chain adapter a pending one can hold the single
+  publisher worker for up to the publish timeout.
+- **Chain reads are assumed to be up to date.** After a receipt is returned,
+  the publisher assumes the next read of the record reflects it. That holds on a
+  single node. A load-balanced RPC endpoint can serve a stale read, and a
+  rollback decided on it can stay uncorrected until the next event for that
+  Deployment.
 - **`pod-verify` checks declared configuration, not convergence.** It does not
   read rollout status or `paused` (see
   [What PASS does not mean](#what-pass-does-not-mean)).
