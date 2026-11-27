@@ -45,22 +45,52 @@ contract are not readable by this version.
 - A rollback to the last published state was dropped as already published,
   even while a newer revision was desired. If the newer revision's transaction
   has already mined when the rollback is processed, the rollback is now
-  republished. If that transaction is still pending, the problem remains: see
-  Known limitations.
+  republished.
+- Rolling back while the newer revision's transaction is still pending no
+  longer leaves the newer revision on chain. The publisher keeps every sent
+  transaction whose outcome it has not observed, including superseded ones, and
+  re-checks them through its own rate-limited retry, without waiting for
+  another reconcile, until each one's receipt reports mined or reverted. When
+  one lands it reads the chain again and republishes the current revision if
+  needed. A revision is never prepared again while an earlier transaction for
+  it is unresolved; that transaction is resent instead. No nonce ordering is
+  assumed. Covered by `TestRollbackWhileTheNewRevisionIsPending`,
+  `TestRollbackRecoversWithoutFurtherEnqueue`, `TestRollbackFlapPublishesOnce`
+  and `TestRollbackWithUnresolvedTxDoesNotRepublish`.
+- A rollback could stall forever when resending the earlier, still unresolved
+  transaction for the same revision failed with "nothing was sent" (for
+  example because it had already mined). The publisher returned before reading
+  that transaction's receipt, on every pass. A send error now aborts the pass
+  only for a transaction's first send; for one already sent, the error is
+  logged and its receipt is read as usual, so it settles and recovery
+  continues without another reconcile. Covered by
+  `TestResendFaultStillReadsTheReceipt`.
 
 ### Known limitations
-- Rolling back while the newer revision's transaction is still pending can
-  leave the newer revision on chain. The operator reads the older record,
-  treats the rollback as published, and does not correct it once the pending
-  transaction mines, until it restarts or the Deployment changes again.
-  Reproduced with the publisher's test doubles in a test that is not yet
-  committed; not fixed.
 - `pod-verify` checks the Deployment's declared configuration. It does not
   confirm that the running Pods have converged to it: it does not read rollout
   status or `paused`.
-- A prepared transaction whose nonce is taken by another transaction is retried
-  until the operator restarts or the Deployment changes. Not yet reproduced in a
-  test; tracked as the next piece of work.
+- A prepared transaction whose nonce is taken by another transaction is resent
+  while its revision is desired; once superseded it is no longer resent, but its
+  receipt keeps being checked until the operator restarts. Not yet reproduced in
+  a test; tracked as the next piece of work. More generally, a sent transaction
+  whose outcome stays unknown, including a superseded one, is re-checked at
+  capped backoff until restart and never replaced: its revision is not prepared
+  again while it is unresolved.
+- The list of unresolved transactions has no cap: a cap would drop a
+  transaction whose outcome is unknown. It holds every sent transaction still
+  waiting for a receipt: a slow one until it settles, and one that never settles
+  (dropped from the mempool, nonce taken) until restart. Retained transactions
+  are waited on again on every retry, and with the real chain adapter a pending
+  one can hold the single publisher worker for up to the publish timeout.
+- The publisher assumes a chain read reflects a write whose receipt was already
+  returned. That holds on a single node without a chain reorganisation; a
+  load-balanced RPC endpoint can serve a stale read, and a rollback decided on it
+  can stay uncorrected until something triggers a fresh check, such as the next
+  change to that Deployment.
+- The record of unresolved transactions is held in memory only. After a
+  restart during a rollback, a superseded transaction that mines later is not
+  corrected until the Deployment changes again or the operator restarts.
 - Literal environment variable values, referenced ConfigMap and Secret
   contents, and the bytes behind an image tag are not hashed. See the README.
 

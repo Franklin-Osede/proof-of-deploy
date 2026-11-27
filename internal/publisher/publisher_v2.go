@@ -44,8 +44,9 @@ import (
 //   - Unknown keeps the attempt. Preparing a replacement would take a fresh
 //     nonce and publish twice.
 //   - Reverted discards the attempt; it definitively did not take effect.
-//   - Mined-success confirms. So does a matching on-chain record, which is how
-//     a lost receipt is recovered.
+//   - Mined-success confirms, unless another of our transactions landed while
+//     it was unresolved; then only a chain read does. A matching on-chain
+//     record also confirms, which is how a lost receipt is recovered.
 //   - A newer revision invalidates the older one, and no in-flight worker may
 //     confirm or publish on behalf of a revision that is no longer desired.
 //   - A confirmation is only trusted until a different revision is desired.
@@ -55,6 +56,11 @@ import (
 //     transaction cannot be recalled.
 //   - The chain is queried before the first Prepare, always. That is also what
 //     recovers state after a restart, when every attempt in memory is gone.
+//
+// Assumption: Latest sees a write whose receipt has already been returned.
+// That holds on a single node. A load-balanced RPC endpoint can serve a stale
+// read, and a rollback decided on it can stay uncorrected until the next event
+// for that workload.
 type PublisherV2 struct {
 	queue  workqueue.RateLimitingInterface
 	signer Signer
@@ -159,6 +165,32 @@ type workloadState struct {
 	signature []byte
 	prepared  PreparedTx
 	confirmed *RevisionKey
+	// sent holds every transaction handed to Send whose own outcome has not
+	// been observed, for this revision or a superseded one. An entry leaves
+	// only when its Wait reports mined or reverted. While any remain, a
+	// confirmation is only what the last read showed, so the chain keeps
+	// being read. prepared, when sent, is one of these entries.
+	sent []sentTx
+}
+
+// sentTx is a transaction that may be on its way to the chain.
+type sentTx struct {
+	tx  PreparedTx
+	key RevisionKey
+	// overlapped is set when another of our transactions was observed to land
+	// while this one was unresolved. Its own receipt then cannot say which of
+	// the two the chain holds.
+	overlapped bool
+}
+
+// sentIndex returns the position of tx in sent, or -1.
+func (st *workloadState) sentIndex(tx PreparedTx) int {
+	for i, s := range st.sent {
+		if s.tx.Hash() == tx.Hash() {
+			return i
+		}
+	}
+	return -1
 }
 
 // NewV2 builds a publisher. The signer's public key is read and parsed once:
@@ -220,7 +252,8 @@ func (p *PublisherV2) recordIsOurs(d Desired, sig []byte) bool {
 // Enqueue records a desired revision. It never blocks and never signs, so the
 // reconcile loop pays nothing for it.
 //
-// A revision that is both desired and confirmed is dropped. Anything else
+// A revision that is both desired and confirmed is dropped, unless a sent
+// transaction is unresolved and may still change what the chain holds. Anything else
 // supersedes whatever was desired before for that workload, including any
 // attempt in flight for it.
 //
@@ -241,7 +274,7 @@ func (p *PublisherV2) Enqueue(d Desired) error {
 		p.state[workloadID] = st
 	}
 	if st.seq != 0 && st.key == key {
-		confirmed := st.confirmed != nil && *st.confirmed == key
+		confirmed := st.confirmed != nil && *st.confirmed == key && len(st.sent) == 0
 		p.mu.Unlock()
 		if !confirmed {
 			// Already the desired revision; the existing attempt continues.
@@ -256,8 +289,17 @@ func (p *PublisherV2) Enqueue(d Desired) error {
 	st.key = key
 	// A new revision invalidates the old signature and the old transaction.
 	// Keeping either would risk publishing a superseded state.
+	// A transaction already sent stays in sent, where it keeps being checked.
 	st.signature = nil
 	st.prepared = nil
+	for _, s := range st.sent {
+		if s.key == key {
+			// An earlier attempt for this same revision is still unresolved.
+			// It becomes the attempt again: preparing another would publish
+			// twice.
+			st.prepared = s.tx
+		}
+	}
 	// What was confirmed described the chain before the revision now being
 	// replaced could be sent. It is no longer evidence of what the chain holds.
 	st.confirmed = nil
@@ -325,6 +367,15 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 		return false, nil
 	}
 
+	// Re-check every unresolved transaction other than the current attempt,
+	// which is checked below. This comes before the chain read, so the read
+	// reflects whatever these are now known to have done.
+	for _, s := range rev.sent {
+		if rev.prepared == nil || s.tx.Hash() != rev.prepared.Hash() {
+			p.recheck(ctx, id, s.tx)
+		}
+	}
+
 	// Always ask the chain first. This is what makes a restart safe: every
 	// attempt in memory is gone, but the record is not, so a workload already
 	// published is never published again.
@@ -334,7 +385,10 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 	}
 	if onchain.Exists && onchain.Key == rev.key {
 		if p.recordIsOurs(rev.desired, onchain.Signature) {
-			return p.confirm(id, rev), nil
+			if rev.prepared != nil && rev.sentIndex(rev.prepared) >= 0 {
+				p.recheck(ctx, id, rev.prepared)
+			}
+			return p.finish(id, p.confirm(id, rev))
 		}
 		// Every field matches and the signature does not verify. Something
 		// wrote our fingerprint over a signature we did not make. Publishing a
@@ -352,20 +406,28 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 	// Signing and the chain read both take time, and a newer revision may have
 	// arrived during either. This is the last point at which that can be acted
 	// on: once sent, the transaction cannot be recalled. The check and the send
-	// are not atomic, so a revision arriving between them is still sent; it is
-	// then superseded on chain by the newer one, which takes a later nonce.
-	if !p.isCurrent(id, rev.seq) {
+	// are not atomic, so a revision arriving between them is still sent. It
+	// is recorded as sent first, so its outcome keeps being checked.
+	current, fresh := p.markSent(id, rev.seq, prepared, rev.key)
+	if !current {
 		p.log.V(1).Info("revision superseded before sending; abandoning it",
 			"deployment", rev.desired.Label)
 		return true, nil
 	}
 
 	sent, err := p.chain.Send(ctx, prepared)
-	if err != nil {
+	switch {
+	case err != nil && fresh:
 		// Nothing was sent; this is a fault, not uncertainty.
+		p.unmarkSent(id, prepared)
 		return false, fmt.Errorf("sending publish: %w", err)
-	}
-	if sent == SendUnknown {
+	case err != nil:
+		// It was sent on an earlier pass, so the error means nothing was sent
+		// THIS time, not that nothing ever was. The node may no longer hold it
+		// because it already mined. Its receipt is what settles it, so wait.
+		p.log.Info("resending an already sent transaction failed; reading its receipt",
+			"deployment", rev.desired.Label, "tx", prepared.Hash(), "error", err.Error())
+	case sent == SendUnknown:
 		// "Already known" reports unknown too, so the transaction may well be
 		// at the node. Waiting is correct; assuming nothing happened is what
 		// causes a second nonce and a second publication.
@@ -384,28 +446,55 @@ func (p *PublisherV2) process(ctx context.Context, id [32]byte) (bool, error) {
 			"deployment", rev.desired.Label,
 			"hashVersion", rev.desired.Version.String(),
 			"tx", prepared.Hash())
-		return p.confirm(id, rev), nil
+		if !p.resolve(id, prepared, outcome) {
+			return p.finish(id, p.confirm(id, rev))
+		}
+		// Another of our transactions landed while this one was unresolved, so
+		// this receipt does not say which of them the chain holds. Only a read
+		// does.
 
 	case WaitReverted:
 		// Definitive: it did not take effect, so the attempt is spent and a
 		// fresh one may be prepared. Backoff is kept deliberately -- a
 		// deterministic revert would otherwise spin.
-		p.discardAttempt(id, rev.seq)
+		p.resolve(id, prepared, outcome)
 		return false, fmt.Errorf("publish reverted for %s (tx %s)", rev.desired.Label, prepared.Hash())
-
-	default:
-		// Unknown. Keep the attempt: it may still mine, and only the chain can
-		// settle it. Reconcile immediately so a lost receipt does not cost a
-		// whole backoff cycle.
-		latest, lerr := p.chain.Latest(ctx, id)
-		if lerr == nil && latest.Exists && latest.Key == rev.key &&
-			p.recordIsOurs(rev.desired, latest.Signature) {
-			p.log.Info("attestation recovered by reconciliation; receipt was lost",
-				"deployment", rev.desired.Label, "tx", prepared.Hash())
-			return p.confirm(id, rev), nil
-		}
-		return false, fmt.Errorf("publish outcome unknown for %s (tx %s)", rev.desired.Label, prepared.Hash())
 	}
+
+	// Unknown: keep the attempt, it may still mine, and only the chain can
+	// settle it. Reconcile immediately so a lost receipt does not cost a whole
+	// backoff cycle.
+	latest, lerr := p.chain.Latest(ctx, id)
+	if lerr == nil && latest.Exists && latest.Key == rev.key &&
+		p.recordIsOurs(rev.desired, latest.Signature) {
+		p.log.Info("attestation recovered by reconciliation; receipt was lost",
+			"deployment", rev.desired.Label, "tx", prepared.Hash())
+		return p.finish(id, p.confirm(id, rev))
+	}
+	if outcome == WaitMinedSuccess {
+		return false, fmt.Errorf("publish for %s mined (tx %s) but the chain holds another record; re-reading",
+			rev.desired.Label, prepared.Hash())
+	}
+	return false, fmt.Errorf("publish outcome unknown for %s (tx %s)", rev.desired.Label, prepared.Hash())
+}
+
+// finish ends a pass that confirmed. Work stops only when nothing sent is
+// unresolved; until then the error sends the workload back through the
+// rate-limited queue, so it is re-checked without another Enqueue.
+func (p *PublisherV2) finish(id [32]byte, again bool) (bool, error) {
+	if again {
+		return true, nil
+	}
+	p.mu.Lock()
+	n := 0
+	if st, ok := p.state[id]; ok {
+		n = len(st.sent)
+	}
+	p.mu.Unlock()
+	if n > 0 {
+		return false, fmt.Errorf("confirmed, but %d sent transaction(s) are unresolved; re-checking", n)
+	}
+	return false, nil
 }
 
 // snapshot copies the desired revision under lock.
@@ -416,10 +505,12 @@ func (p *PublisherV2) snapshot(id [32]byte) (workloadState, bool) {
 	if !ok || st.seq == 0 {
 		return workloadState{}, false
 	}
-	if st.confirmed != nil && *st.confirmed == st.key {
+	if st.confirmed != nil && *st.confirmed == st.key && len(st.sent) == 0 {
 		return workloadState{}, false
 	}
-	return *st, true
+	rev := *st
+	rev.sent = append([]sentTx(nil), st.sent...)
+	return rev, true
 }
 
 // prepareOnce signs and prepares a revision the first time, and reuses both
@@ -475,22 +566,77 @@ func (p *PublisherV2) confirm(id [32]byte, rev workloadState) bool {
 		// but it is not what is wanted now.
 		return true
 	}
-	st.prepared = nil
+	// A sent attempt whose outcome is unknown is kept: it may still mine.
+	if st.prepared != nil && st.sentIndex(st.prepared) < 0 {
+		st.prepared = nil
+	}
 	return false
 }
 
-// isCurrent reports whether seq is still the desired revision for a workload.
-func (p *PublisherV2) isCurrent(id [32]byte, seq uint64) bool {
+// markSent records tx as sent, if seq is still the desired revision. It
+// reports whether it is, and whether this call added the entry.
+func (p *PublisherV2) markSent(id [32]byte, seq uint64, tx PreparedTx, key RevisionKey) (current, fresh bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	st, ok := p.state[id]
-	return ok && st.seq == seq
+	if !ok || st.seq != seq {
+		return false, false
+	}
+	if st.sentIndex(tx) >= 0 {
+		return true, false
+	}
+	st.sent = append(st.sent, sentTx{tx: tx, key: key})
+	return true, true
 }
 
-func (p *PublisherV2) discardAttempt(id [32]byte, seq uint64) {
+// unmarkSent forgets tx after a Send that reported nothing was sent.
+func (p *PublisherV2) unmarkSent(id [32]byte, tx PreparedTx) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if st, ok := p.state[id]; ok && st.seq == seq {
+	if st, ok := p.state[id]; ok {
+		if i := st.sentIndex(tx); i >= 0 {
+			st.sent = append(st.sent[:i:i], st.sent[i+1:]...)
+		}
+	}
+}
+
+// recheck asks for a sent transaction's outcome again and records it.
+func (p *PublisherV2) recheck(ctx context.Context, id [32]byte, tx PreparedTx) {
+	outcome, err := p.chain.Wait(ctx, tx)
+	if err != nil {
+		p.log.V(1).Info("re-checking a sent transaction failed; it stays tracked", "tx", tx.Hash(), "error", err.Error())
+		return
+	}
+	p.resolve(id, tx, outcome)
+}
+
+// resolve records what a sent transaction's own Wait reported. Only mined and
+// reverted end tracking. A mined transaction changed the chain, so what was
+// confirmed is no longer evidence, and every transaction still unresolved is
+// marked overlapped. It reports whether tx itself was overlapped.
+func (p *PublisherV2) resolve(id [32]byte, tx PreparedTx, outcome WaitOutcome) bool {
+	if outcome != WaitMinedSuccess && outcome != WaitReverted {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st, ok := p.state[id]
+	if !ok {
+		return false
+	}
+	overlapped := false
+	if i := st.sentIndex(tx); i >= 0 {
+		overlapped = st.sent[i].overlapped
+		st.sent = append(st.sent[:i:i], st.sent[i+1:]...)
+	}
+	if st.prepared != nil && st.prepared.Hash() == tx.Hash() {
 		st.prepared = nil
 	}
+	if outcome == WaitMinedSuccess {
+		st.confirmed = nil
+		for i := range st.sent {
+			st.sent[i].overlapped = true
+		}
+	}
+	return overlapped
 }
